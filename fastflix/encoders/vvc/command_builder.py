@@ -18,10 +18,47 @@ from fastflix.models.encode import VVCSettings
 from fastflix.models.fastflix import FastFlix
 
 
+def is_constant_qp(fastflix: FastFlix) -> bool:
+    """QP mode without a maxrate: VVenC refuses CuTreePicStrength and NumParallelGOPs > 0 under any rate control."""
+    settings: VVCSettings = fastflix.current_video.video_settings.video_encoder_settings
+    return settings.qp is not None and not settings.bitrate and not fastflix.current_video.video_settings.maxrate
+
+
+def generated_vvenc_params(settings: VVCSettings, constant_qp: bool) -> list[str]:
+    """The VVenC Key=Value options FastFlix sets from its panel."""
+    params = []
+    qp_mode = settings.qp is not None and not settings.bitrate
+    if qp_mode and not float(settings.qp).is_integer():
+        params.append(f"QP={float(settings.qp):g}")
+    params.append(f"BIM={settings.bim}")
+    # The longer look-ahead only pays together with the picture QPs, so it is sent only with them
+    if constant_qp and settings.bim == 1 and settings.cutree_pic_strength:
+        params.append(f"CuTreePicStrength={settings.cutree_pic_strength}")
+        params.append(f"CuTreeLookAheadGOPs={settings.cutree_lookahead_gops}")
+    if settings.adaptive_intra:
+        params.append("AdaptiveIntra=1")
+    params.append(f"DecodingRefreshType={settings.refresh_type}")
+    if settings.mctf_level_tilt:
+        params.append(f"MCTFLevelTilt={settings.mctf_level_tilt}")
+    if settings.fga:
+        params.append(f"fga={settings.fga}")
+        if settings.fga_strength != 100:
+            params.append(f"fgastrength={settings.fga_strength / 100:g}")
+    if settings.ifp != "auto":
+        params.append(f"IFP={1 if settings.ifp == 'on' else 0}")
+    if constant_qp and settings.num_parallel_gops != -1:
+        params.append(f"NumParallelGOPs={settings.num_parallel_gops}")
+    if settings.same_output_any_threads:
+        params.append("mtprofile=0")
+    return params
+
+
 def build(fastflix: FastFlix):
     settings: VVCSettings = fastflix.current_video.video_settings.video_encoder_settings
 
     beginning, ending, output_fps = generate_all(fastflix, "libvvenc")
+    if fastflix.config.vvc_ffmpeg:
+        beginning[0] = str(fastflix.config.vvc_ffmpeg)
 
     if settings.tier:
         beginning.extend(["-tier:v", settings.tier])
@@ -32,16 +69,12 @@ def build(fastflix: FastFlix):
     if not settings.subjopt:
         beginning.extend(["-qpa", "0"])
 
-    if settings.period is not None:
-        beginning.extend(["-period", str(settings.period)])
+    beginning.extend(["-period", str(settings.period)])
 
     if settings.threads > 0:
         beginning.extend(["-threads", str(settings.threads)])
 
-    vvc_params = settings.vvc_params.copy() or []
-
-    if settings.ifp:
-        vvc_params.append("ifp=1")
+    vvc_params = generated_vvenc_params(settings, constant_qp=is_constant_qp(fastflix))
 
     if not fastflix.current_video.video_settings.remove_hdr:
         # Color primaries/transfer/matrix via FFmpeg flags (libvvenc reads these for VUI)
@@ -83,6 +116,8 @@ def build(fastflix: FastFlix):
 
     pass_log_file = fastflix.current_video.work_path / f"pass_log_file_{secrets.token_hex(10)}"
 
+    # The user's own params go last, so they override the generated ones
+    vvc_params += settings.vvc_params
     vvenc_params = ["-vvenc-params", ":".join(vvc_params)] if vvc_params else []
 
     extra = shlex.split(settings.extra) if settings.extra else []
@@ -110,11 +145,12 @@ def build(fastflix: FastFlix):
             Command(command=command_2, name="Second pass bitrate", exe="ffmpeg"),
         ]
 
-    elif settings.qp:
+    elif settings.qp is not None:
+        # FFmpeg's -qp takes whole numbers only; a fractional QP is passed as QP= in -vvenc-params, which wins
         command = (
             beginning
             + vvenc_params
-            + ["-qp:v", str(settings.qp), "-b:v", "0", "-preset:v", settings.preset]
+            + ["-qp:v", str(int(float(settings.qp))), "-b:v", "0", "-preset:v", settings.preset]
             + extra
             + ending
         )

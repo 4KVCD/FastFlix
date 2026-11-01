@@ -233,6 +233,8 @@ class Config(BaseModel):
     config_path: Path = Field(default_factory=get_config)
     ffmpeg: Path = Field(default_factory=lambda: find_ffmpeg_file("ffmpeg"))
     ffprobe: Path = Field(default_factory=lambda: find_ffmpeg_file("ffprobe"))
+    # An FFmpeg used only for VVC encodes, e.g. one built with a newer VVenC than the main FFmpeg's
+    vvc_ffmpeg: Path | None = None
     hdr10plus_parser: Path | None = Field(default_factory=find_hdr10plus_tool)
     nvencc: Path | None = Field(default_factory=lambda: find_rigaya_encoder("NVEncC"))
     vceencc: Path | None = Field(default_factory=lambda: find_rigaya_encoder("VCEEncC"))
@@ -444,6 +446,7 @@ class Config(BaseModel):
             "vceencc",
             "qsvencc",
             "gifski",
+            "vvc_ffmpeg",
         )
         for key, value in data.items():
             if key == "profiles":

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 from box import Box
@@ -153,9 +153,37 @@ class VVCSettings(EncoderSettings):
     tier: str = "main"
     subjopt: bool = True
     levelidc: str | None = None
-    period: int | None = None
+    period: int = 10  # intra period in seconds
     threads: int = 0  # 0 = auto
-    ifp: bool = False
+    ifp: Literal["auto", "on", "off"] = "auto"
+    # FastFlix's defaults for the improved VVenC: its presets use BIM 2 and none of the CU-tree picture QPs,
+    # scene-cut intra or grain analysis
+    bim: int = 1  # block importance: 0 off, 1 CU tree, 2 from MCTF's motion error
+    cutree_pic_strength: int = 2  # picture QPs from the CU tree; constant QP only
+    cutree_lookahead_gops: int = 4  # 1-4 GOPs; each extra GOP holds one more GOP of pictures in RAM
+    adaptive_intra: bool = True  # I pictures at scene cuts
+    refresh_type: Literal["cra", "idr"] = "cra"  # open or closed GOP
+    mctf_level_tilt: int = 100  # MCTF strength raise for the pictures others predict from: 0 off, 100 tuned, max 300
+    fga: int = 2  # film grain analysis: 0 off, 1-3 (3 is not decodable by FFmpeg's VVC decoder)
+    fga_strength: int = 100  # percent of the analysed grain, 1-399
+    num_parallel_gops: int = 4  # GOPs encoded at once at constant QP (faster, more RAM); -1 = VVenC's own choice
+    same_output_any_threads: bool = False  # mtprofile=0
+
+    @field_validator("ifp", mode="before")
+    @classmethod
+    def ifp_from_checkbox(cls, value):
+        # Older settings stored a checkbox: on sent ifp=1, off sent nothing (VVenC's automatic choice)
+        if isinstance(value, bool):
+            return "on" if value else "auto"
+        return value
+
+    @field_validator("period", mode="before")
+    @classmethod
+    def period_from_auto(cls, value):
+        # Older settings used None for "auto" (FFmpeg's 1 s) and offered 0, which FFmpeg's -period rejects
+        if value is None or int(value) < 1:
+            return 10
+        return int(value)
 
 
 class x264Settings(EncoderSettings):

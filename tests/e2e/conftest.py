@@ -75,6 +75,9 @@ SKIP_MAC = os.environ.get("SKIP_MAC", "").lower() in ("1", "true", "yes")
 # ---------------------------------------------------------------------------
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
+# An FFmpeg whose VVenC has the options FastFlix's VVC defaults use (CU-tree picture QPs, scene-cut intra);
+# a stock libvvenc fails on them
+VVC_FFMPEG = os.environ.get("FF_VVC_FFMPEG")
 
 
 def _find_rigaya(app_name: str, binary_base: str) -> Optional[str]:
@@ -331,6 +334,7 @@ def create_fastflix(
         ffmpeg=Path(FFMPEG),
         ffprobe=Path(FFPROBE),
         work_path=work_path,
+        vvc_ffmpeg=Path(VVC_FFMPEG) if VVC_FFMPEG else None,
     )
     if is_rigaya:
         if NVENCC:
@@ -490,7 +494,7 @@ FFMPEG_ENCODERS = [
         lambda: not has_ffmpeg_encoder("libvpx-vp9"),
         False,
     ),
-    ("vvc", VVCSettings(preset="faster", qp=51), ".mkv", "vvc", lambda: not has_ffmpeg_encoder("libvvenc"), False),
+    ("vvc", VVCSettings(preset="faster", qp=51), ".mkv", "vvc", lambda: not VVC_FFMPEG, False),
     ("copy", CopySettings(), ".mkv", "h264", lambda: False, False),
 ]
 

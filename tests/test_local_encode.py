@@ -75,6 +75,9 @@ TEST_SOURCE_ATTACHMENTS = Path(__file__).parent / "media" / "font_attachment_dat
 TEST_SOURCE_CHAPTERS = Path(__file__).parent / "media" / "chapters_timecode.mp4"
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
+# An FFmpeg whose VVenC has the options FastFlix's VVC defaults use (CU-tree picture QPs, scene-cut intra);
+# a stock libvvenc fails on them
+VVC_FFMPEG = os.environ.get("FF_VVC_FFMPEG")
 
 if not FFMPEG or not FFPROBE:
     pytestmark.append(pytest.mark.skip(reason="ffmpeg/ffprobe not found"))
@@ -209,6 +212,7 @@ def create_real_fastflix(encoder_settings, output_path: Path, work_path: Path, i
         ffmpeg=Path(FFMPEG),
         ffprobe=Path(FFPROBE),
         work_path=work_path,
+        vvc_ffmpeg=Path(VVC_FFMPEG) if VVC_FFMPEG else None,
     )
 
     if is_rigaya:
@@ -371,7 +375,7 @@ _add(
     VVCSettings(preset="faster", qp=51),
     ".mkv",
     "vvc",
-    lambda: not _has_ffmpeg_encoder("libvvenc"),
+    lambda: not VVC_FFMPEG,
 )
 _add(
     "webp",

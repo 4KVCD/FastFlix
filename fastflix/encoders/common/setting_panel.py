@@ -376,7 +376,9 @@ class SettingPanel(QtWidgets.QWidget):
         show_bitrate_passes=False,
         disable_bitrate=False,
         qp_display_name=None,
+        qp_text_box_only=False,
     ):
+        """qp_text_box_only: show only the custom QP text box (recommended_qps must contain "Custom")."""
         if not qp_display_name:
             qp_display_name = qp_name.upper()
         self.recommended_bitrates = recommended_bitrates
@@ -468,6 +470,10 @@ class SettingPanel(QtWidgets.QWidget):
         else:
             if default_qp_index is not None:
                 self.widgets[qp_name].setCurrentIndex(default_qp_index)
+        if qp_text_box_only:
+            # The combo stays hidden on "Custom", so the shared read and restore code uses the text box
+            self.widgets[qp_name].setCurrentText("Custom")
+            custom_qp = True
 
         if not disable_custom_qp:
             self.widgets[f"custom_{qp_name}"] = QtWidgets.QLineEdit("30" if not custom_qp else str(qp_value))
@@ -487,13 +493,15 @@ class SettingPanel(QtWidgets.QWidget):
             self.widgets.bitrate_passes.currentIndexChanged.connect(lambda: self.mode_update())
             self.widgets.bitrate.currentIndexChanged.connect(lambda: self.mode_update())
         self.widgets[qp_name].currentIndexChanged.connect(lambda: self.mode_update())
-        qp_box_layout.addWidget(self.widgets[qp_name])
+        if not qp_text_box_only:
+            qp_box_layout.addWidget(self.widgets[qp_name])
         qp_box_layout.addStretch(1)
         qp_box_layout.addStretch(1)
         if disable_custom_qp:
             qp_box_layout.addStretch(1)
         else:
-            qp_box_layout.addWidget(QtWidgets.QLabel(t("Custom") + ":"))
+            if not qp_text_box_only:
+                qp_box_layout.addWidget(QtWidgets.QLabel(t("Custom") + ":"))
             qp_box_layout.addWidget(self.widgets[f"custom_{qp_name}"])
         qp_box_layout.addWidget(QtWidgets.QLabel("  "))
 

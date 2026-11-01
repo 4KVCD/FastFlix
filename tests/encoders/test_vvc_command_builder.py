@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from pathlib import Path
 from unittest import mock
 
 from fastflix.encoders.vvc.command_builder import build
@@ -8,7 +9,13 @@ from fastflix.models.video import VideoSettings
 from tests.conftest import create_fastflix_instance
 
 
-def _build_with_settings(hdr10=False, remove_hdr=False, **kwargs):
+def _build_with_settings(
+    hdr10=False,
+    remove_hdr=False,
+    maxrate=None,
+    vvc_ffmpeg=None,
+    **kwargs,
+):
     """Helper to build VVC commands with custom settings."""
     defaults = dict(
         qp=22,
@@ -19,9 +26,10 @@ def _build_with_settings(hdr10=False, remove_hdr=False, **kwargs):
     defaults.update(kwargs)
     fastflix = create_fastflix_instance(
         encoder_settings=VVCSettings(**defaults),
-        video_settings=VideoSettings(remove_hdr=remove_hdr, maxrate=None, bufsize=None),
+        video_settings=VideoSettings(remove_hdr=remove_hdr, maxrate=maxrate, bufsize=None),
         hdr10_metadata=hdr10,
     )
+    fastflix.config.vvc_ffmpeg = vvc_ffmpeg
     with mock.patch("fastflix.encoders.vvc.command_builder.generate_all") as mock_gen:
         mock_gen.return_value = (["ffmpeg", "-y", "-i", "input.mkv"], ["output.mkv"], ["-r", "24"])
         result = build(fastflix)
@@ -95,11 +103,11 @@ def test_vvc_period():
     assert cmd[idx + 1] == "2"
 
 
-def test_vvc_period_none():
-    """Test period is not included when None."""
-    result = _build_with_settings(period=None)
-    cmd = result[0].command
-    assert "-period" not in cmd
+def test_vvc_legacy_period_auto_becomes_10_seconds():
+    """Older settings stored None (auto) or 0 (rejected by FFmpeg); both load as the 10 s default."""
+    for legacy_period in (None, 0, "0", -2):
+        cmd = _build_with_settings(period=legacy_period)[0].command
+        assert cmd[cmd.index("-period") + 1] == "10"
 
 
 def test_vvc_threads():
@@ -118,23 +126,13 @@ def test_vvc_threads_auto():
     assert "-threads" not in cmd
 
 
-def test_vvc_ifp_enabled():
-    """Test IFP is appended to vvc-params when enabled."""
-    result = _build_with_settings(ifp=True)
-    cmd = result[0].command
-    assert "-vvenc-params" in cmd
-    idx = cmd.index("-vvenc-params")
-    assert "ifp=1" in cmd[idx + 1]
-
-
-def test_vvc_ifp_disabled():
-    """Test IFP is not included when disabled."""
-    result = _build_with_settings(ifp=False)
-    cmd = result[0].command
-    # Should not have vvenc-params at all with no other params
-    if "-vvenc-params" in cmd:
-        idx = cmd.index("-vvenc-params")
-        assert "ifp=1" not in cmd[idx + 1]
+def test_vvc_ifp_choices():
+    """IFP auto sends nothing; on and off are sent; the old checkbox's True means on, False auto."""
+    for ifp, expected in (("on", "IFP=1"), ("off", "IFP=0"), (True, "IFP=1")):
+        assert expected in _params(_build_with_settings(ifp=ifp)[0].command).split(":")
+    for ifp in ("auto", False):
+        params = _params(_build_with_settings(ifp=ifp)[0].command).split(":")
+        assert not any(param.startswith("IFP=") for param in params)
 
 
 def test_vvc_vvc_params():
@@ -144,13 +142,6 @@ def test_vvc_vvc_params():
     assert "-vvenc-params" in cmd
     idx = cmd.index("-vvenc-params")
     assert "rcstatsfile=test" in cmd[idx + 1]
-
-
-def test_vvc_no_vvc_params_when_empty():
-    """Test that -vvenc-params is not added when no params."""
-    result = _build_with_settings(vvc_params=[], ifp=False)
-    cmd = result[0].command
-    assert "-vvenc-params" not in cmd
 
 
 def test_vvc_all_elements_are_strings():
@@ -296,3 +287,73 @@ def test_vvc_hdr_metadata_for_422_10bit():
     params = _params(result[0].command)
     assert "MasteringDisplayColourVolume=" in params
     assert "MaxContentLightLevel=1000,300" in params
+
+
+def _param_list(cmd):
+    return _params(cmd).split(":")
+
+
+def test_vvc_default_qp_turns_on_every_new_vvenc_option():
+    params = _param_list(_build_with_settings()[0].command)
+    assert params == [
+        "BIM=1",
+        "CuTreePicStrength=2",
+        "CuTreeLookAheadGOPs=4",
+        "AdaptiveIntra=1",
+        "DecodingRefreshType=cra",
+        "MCTFLevelTilt=100",
+        "fga=2",
+        "NumParallelGOPs=4",
+    ]
+    tilt_off = _param_list(_build_with_settings(mctf_level_tilt=0)[0].command)
+    assert not any(param.startswith("MCTFLevelTilt") for param in tilt_off)
+
+
+def test_vvc_fractional_qp():
+    """FFmpeg's -qp is a whole number; the fraction reaches VVenC as QP= (also with a maxrate cap)."""
+    for maxrate in (None, 8000):
+        cmd = _build_with_settings(qp=27.5, maxrate=maxrate)[0].command
+        assert cmd[cmd.index("-qp:v") + 1] == "27"
+        assert "QP=27.5" in _param_list(cmd)
+    whole = _build_with_settings(qp=27.0)[0].command
+    assert not any(param.startswith("QP=") for param in _param_list(whole))
+
+
+def test_vvc_qp_zero_is_a_qp_encode():
+    cmd = _build_with_settings(qp=0)[0].command
+    assert cmd[cmd.index("-qp:v") + 1] == "0"
+
+
+def test_vvc_rate_control_never_gets_cutree_picture_qps_or_parallel_gops():
+    """VVenC refuses CuTreePicStrength and NumParallelGOPs > 0 with a target bitrate or a maxrate."""
+    for cmd in (
+        _build_with_settings(qp=None, bitrate="6000k", num_parallel_gops=4)[1].command,
+        _build_with_settings(maxrate=8000, num_parallel_gops=4)[0].command,
+    ):
+        params = _param_list(cmd)
+        assert "BIM=1" in params
+        assert not any(param.startswith(("CuTree", "NumParallelGOPs")) for param in params)
+
+
+def test_vvc_cutree_options_need_bim_1():
+    params = _param_list(_build_with_settings(bim=2)[0].command)
+    assert "BIM=2" in params
+    assert not any(param.startswith("CuTree") for param in params)
+
+
+def test_vvc_user_params_come_last_and_win():
+    params = _param_list(_build_with_settings(vvc_params=["BIM=2"])[0].command)
+    assert params[-1] == "BIM=2"
+
+
+def test_vvc_grain_strength_and_speed_options():
+    params = _param_list(
+        _build_with_settings(fga=3, fga_strength=50, num_parallel_gops=4, same_output_any_threads=True)[0].command
+    )
+    assert {"fga=3", "fgastrength=0.5", "NumParallelGOPs=4", "mtprofile=0"} <= set(params)
+    assert not any(param.startswith("fga") for param in _param_list(_build_with_settings(fga=0)[0].command))
+
+
+def test_vvc_ffmpeg_used_for_vvc_encodes():
+    cmd = _build_with_settings(vvc_ffmpeg=Path("C:/w/ffvvc/ffmpeg.exe"))[0].command
+    assert cmd[0] == str(Path("C:/w/ffvvc/ffmpeg.exe"))
