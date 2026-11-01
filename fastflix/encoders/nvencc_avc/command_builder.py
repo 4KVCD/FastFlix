@@ -160,7 +160,7 @@ def build(fastflix: FastFlix):
     if settings.metrics:
         command.extend(["--psnr", "--ssim"])
 
-    command.extend(build_audio(video.audio_tracks, video.streams.audio))
+    command.extend(build_audio(video.audio_tracks, video.streams.audio, video.video_settings.output_path))
     command.extend(
         build_subtitle(
             video.subtitle_tracks,

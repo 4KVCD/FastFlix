@@ -363,3 +363,38 @@ class TestBuildAudioAttributeError:
         # Should fall back to stereo without crashing
         result = build_audio([track])
         assert "-c:0" in result and "aac" in result
+
+
+def test_converts_by_default():
+    """New audio tracks convert to libopus unless the encoder cannot write it, is Copy, or the source is Opus."""
+    from fastflix.widgets.panels.audio_panel import converts_by_default
+
+    assert converts_by_default(["aac", "libopus"], "VVC", "truehd")
+    assert not converts_by_default(["aac"], "VVC", "truehd")
+    assert not converts_by_default(["aac", "libopus"], "Copy", "truehd")
+    assert not converts_by_default(["aac", "libopus"], "VVC", "opus")
+
+
+def test_drop_default_conversion_keeps_a_chosen_conversion():
+    """Switching to Copy copies the tracks with the default conversion, not a conversion the user chose."""
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from fastflix.widgets.panels.audio_panel import AudioList
+
+    default_track = AudioTrack(index=1, outdex=1, conversion_codec="libopus", conversion_bitrate="128")
+    default_track.default_conversion = True
+    chosen_track = AudioTrack(index=2, outdex=2, conversion_codec="libopus", conversion_bitrate="128")
+    widgets = [SimpleNamespace(index=0, check_conversion_button=mock.Mock()), SimpleNamespace(index=1)]
+    audio_list = SimpleNamespace(
+        tracks=widgets,
+        app=SimpleNamespace(
+            fastflix=SimpleNamespace(current_video=SimpleNamespace(audio_tracks=[default_track, chosen_track]))
+        ),
+    )
+
+    AudioList.drop_default_conversion(audio_list)
+
+    assert default_track.conversion_codec == "" and default_track.conversion_bitrate is None
+    assert chosen_track.conversion_codec == "libopus"
+    widgets[0].check_conversion_button.assert_called_once()

@@ -370,6 +370,7 @@ def test_generate_all(fastflix_instance):
         mock_build_audio.assert_called_once_with(
             fastflix_instance.current_video.audio_tracks,
             reverse_video=fastflix_instance.current_video.video_settings.reverse_video,
+            output_suffix=fastflix_instance.current_video.video_settings.output_path.suffix,
         )
         mock_build_subtitle.assert_called_once_with(
             fastflix_instance.current_video.subtitle_tracks,

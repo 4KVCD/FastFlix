@@ -243,6 +243,9 @@ class VideoOptions(QtWidgets.QTabWidget):
             )
         if previous_encoder_no_audio:
             self.audio.new_source(self.audio_formats)
+        elif conversion.lower() == "copy" and self.app.fastflix.current_video and not self.reloading:
+            # Not while a queued job is reloaded: its tracks are rebuilt from the job afterwards, as it was queued
+            self.audio.drop_default_conversion()
         # Page update does a reload which bases itself off the current encoder so we have to do audio formats after
         if not self.reloading:
             self.audio.allowed_formats(self._get_audio_formats(encoder))

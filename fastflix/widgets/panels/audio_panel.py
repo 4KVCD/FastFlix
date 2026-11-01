@@ -25,6 +25,23 @@ from fastflix.widgets.windows.disposition import Disposition
 language_list = [v.name for v in iter_langs() if v.pt2b and v.pt1] + ["Undefined"]
 logger = logging.getLogger("fastflix")
 
+# New audio tracks are converted to Opus at 128 kb/s, keeping their channels up to 7.1 (build_audio picks a layout
+# libopus accepts). The bitrate is in kb/s, as the conversion window stores it.
+DEFAULT_AUDIO_CODEC = "libopus"
+DEFAULT_AUDIO_BITRATE = "128"
+
+
+def converts_by_default(codecs, encoder_name: str, source_codec: str) -> bool:
+    """Whether a new audio track gets the default conversion: the encoder can write it, the encoder is not Copy
+    (a remux keeps its audio as it is), and the source is not Opus already (converting it again would only lose
+    quality)."""
+    return (
+        DEFAULT_AUDIO_CODEC in (codecs or [])
+        and (encoder_name or "").strip().lower() != "copy"
+        and source_codec != "opus"
+    )
+
+
 # Mapping of channel counts to friendly names
 channels_to_layout = {
     1: "Mono",
@@ -228,6 +245,7 @@ class Audio(QtWidgets.QTabWidget):
             grid.addWidget(self.widgets.dup_button, 0, right_button_start_index + 1)
         self.setLayout(grid)
         self.check_dis_button()
+        self.check_conversion_button()  # a track can start with a conversion (the default, a profile, the queue)
         self.conversion_box = None
         self.loading = False
 
@@ -443,7 +461,23 @@ class AudioList(FlixList):
     def disable_all(self):
         self.select_all(False)
 
-    def new_source(self, codecs):
+    def drop_default_conversion(self):
+        """Switching to the Copy encoder copies the tracks that only had the default conversion; a conversion saved in
+        the conversion window is the user's choice and stays."""
+        audio_tracks = self.app.fastflix.current_video.audio_tracks
+        for track in self.tracks:
+            if track.index >= len(audio_tracks):
+                continue
+            audio_track = audio_tracks[track.index]
+            if audio_track.default_conversion:
+                audio_track.conversion_codec = ""
+                audio_track.conversion_bitrate = None
+                audio_track.default_conversion = False
+                track.check_conversion_button()
+
+    def new_source(self, codecs, default_conversion=True):
+        """default_conversion: new tracks are converted to DEFAULT_AUDIO_CODEC (off for a profile's audio filters,
+        whose matches say themselves whether to convert)."""
         if not self.app.fastflix.current_video:
             return
         clear_list(self.tracks, close=True)
@@ -452,8 +486,12 @@ class AudioList(FlixList):
         self._first_selected = False
         for i, x in enumerate(self.app.fastflix.current_video.streams.audio):
             track_info, tags = self._get_track_info(x)
+            conversion = default_conversion and converts_by_default(codecs, self.main.convert_to, x.get("codec_name"))
             self.app.fastflix.current_video.audio_tracks.append(
                 AudioTrack(
+                    conversion_codec=DEFAULT_AUDIO_CODEC if conversion else "",
+                    conversion_bitrate=DEFAULT_AUDIO_BITRATE if conversion else None,
+                    default_conversion=conversion,
                     index=x.index,
                     outdex=i + 1,
                     title=tags.get("title", ""),
@@ -587,7 +625,7 @@ class AudioList(FlixList):
 
             return new_item
 
-        self.new_source(audio_formats)
+        self.new_source(audio_formats, default_conversion=False)
 
         # # First populate all original tracks and disable them
         # for i, track in enumerate(original_tracks, start=1):

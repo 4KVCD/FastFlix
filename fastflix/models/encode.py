@@ -22,6 +22,7 @@ class AudioTrack(BaseModel):
     profile: Optional[str] = None
     enabled: bool = True
     original: bool = False
+    default_conversion: bool = False  # the conversion is the new-track default, not one the user chose
     channels: int = 2
     friendly_info: str = ""
     raw_info: Optional[Union[dict, Box]] = None

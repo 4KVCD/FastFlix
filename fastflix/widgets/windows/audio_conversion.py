@@ -243,6 +243,7 @@ class AudioConversion(QtWidgets.QWidget):
         else:
             self.audio_track.conversion_codec = ""
 
+        self.audio_track.default_conversion = False  # the user chose this conversion
         profile_values = {0: None, 1: "aac_he", 2: "aac_he_v2"}
         profile = profile_values.get(self.aac_profile.currentIndex())
         self.audio_track.conversion_profile = profile if self.audio_track.conversion_codec == "libfdk_aac" else None

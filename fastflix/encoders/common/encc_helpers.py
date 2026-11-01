@@ -1,10 +1,20 @@
 # -*- coding: utf-8 -*-
 import logging
 from fractions import Fraction
+from pathlib import Path
 from typing import List, Optional
 
 from fastflix.models.video import SubtitleTrack, AudioTrack, DataTrack, Video
-from fastflix.encoders.common.audio import lossless, resolve_aac_profile, channel_list
+from fastflix.encoders.common.audio import (
+    channel_list,
+    channels_for_layout,
+    ffmpeg_layout_names,
+    lossless,
+    no_opus_extensions,
+    opus_channel_layout,
+    warn_once,
+    resolve_aac_profile,
+)
 from fastflix.encoders.common.helpers import split_extra_args  # noqa: F401  (re-exported for builders)
 from fastflix.models.fastflix import FastFlix
 from fastflix.models.encode import VCEEncCAVCSettings, VCEEncCAV1Settings, VCEEncCSettings
@@ -214,17 +224,22 @@ def get_stream_pos(streams) -> dict:
     return {x.index: i for i, x in enumerate(streams, start=1)}
 
 
-def build_audio(audio_tracks: list[AudioTrack], audio_streams) -> List[str]:
+def build_audio(audio_tracks: list[AudioTrack], audio_streams, output_path=None) -> List[str]:
+    """output_path: the output file; a libopus conversion is copied instead where Opus cannot go."""
     if not audio_tracks:
         return []
     command_list = []
     copies = []
     track_ids = set()
     stream_ids = get_stream_pos(audio_streams)
+    output_suffix = Path(output_path).suffix.lower() if output_path else ""
 
     for track in sorted(audio_tracks, key=lambda x: x.outdex):
         if not track.enabled:
             continue
+        if track.conversion_codec == "libopus" and output_suffix in no_opus_extensions:
+            warn_once(f"Opus cannot go into {output_suffix} files: audio track {track.index} is copied instead")
+            track = track.model_copy(update={"conversion_codec": ""})
         if track.index in track_ids:
             logger.warning("*EncC does not support copy and duplicate of audio tracks!")
         track_ids.add(track.index)
@@ -235,13 +250,18 @@ def build_audio(audio_tracks: list[AudioTrack], audio_streams) -> List[str]:
             copies.append(str(audio_id))
         elif track.conversion_codec:
             if track.downmix and track.downmix != "No Downmix":
-                downmix = ["--audio-stream", f"{audio_id}?:{track.downmix}"]
+                layout = ffmpeg_layout_names.get(track.downmix, track.downmix)
             else:
-                raw_layout = track.raw_info.get("channel_layout", "") if track.raw_info else ""
-                if raw_layout:
-                    downmix = ["--audio-stream", f"{audio_id}?:{raw_layout}"]
-                else:
-                    downmix = []
+                layout = track.raw_info.get("channel_layout", "") if track.raw_info else ""
+            if track.conversion_codec == "libopus":
+                channels = (track.raw_info.get("channels") if track.raw_info else None) or track.channels
+                opus_layout = opus_channel_layout(layout, channels_for_layout(layout, channels))
+                source_layout = track.raw_info.get("channel_layout") if track.raw_info else None
+                if track.downmix and layout not in (opus_layout, source_layout):
+                    # --audio-stream takes one layout: a chosen one libopus cannot take is not applied first
+                    warn_once(f"Opus cannot hold {layout}: audio track {track.index} is encoded as {opus_layout}")
+                layout = opus_layout
+            downmix = ["--audio-stream", f"{audio_id}?:{layout}"] if layout else []
             bitrate_parts = []
             if track.conversion_codec not in lossless:
                 if track.conversion_bitrate:

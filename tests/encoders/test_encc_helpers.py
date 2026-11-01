@@ -346,6 +346,17 @@ def test_build_audio_convert_tracks(sample_audio_tracks):
     assert "--audio-quality" in result and "2?3" in result
 
 
+def test_build_audio_libopus_gets_a_layout_it_accepts(sample_audio_tracks):
+    """The rigaya encoders pass the layout to libopus too: 5.1(side) becomes 5.1, which libopus accepts."""
+    sample_audio_tracks[0].conversion_codec = "libopus"
+    sample_audio_tracks[0].conversion_bitrate = "128"
+
+    result = build_audio(sample_audio_tracks, [Box({"index": 1}), Box({"index": 2}), Box({"index": 3})])
+
+    assert "1?:5.1" in result
+    assert "1?libopus" in result
+
+
 def test_build_subtitle_empty():
     """Test the build_subtitle function with an empty list."""
     result = build_subtitle([], [], 1080)
@@ -1093,3 +1104,14 @@ def test_build_subtitle_remove_metadata_clears_copied_tracks(sample_subtitle_tra
 def test_build_subtitle_keeps_metadata_by_default(sample_subtitle_tracks):
     subtitle_streams = [Box({"index": 0}), Box({"index": 1}), Box({"index": 2})]
     assert not [x for x in build_subtitle(sample_subtitle_tracks, subtitle_streams, 1080) if x.endswith("?clear")]
+
+
+def test_build_audio_libopus_copied_where_opus_cannot_go(sample_audio_tracks):
+    """A .mov output cannot hold Opus: the rigaya encoders copy that track instead."""
+    sample_audio_tracks[0].conversion_codec = "libopus"
+    sample_audio_tracks[0].conversion_bitrate = "128"
+
+    result = build_audio(sample_audio_tracks, [Box({"index": 1}), Box({"index": 2}), Box({"index": 3})], "out.mov")
+
+    assert "1?libopus" not in result
+    assert result[result.index("--audio-copy") + 1] == "1,2"  # track 1 joins track 2, which is copied anyway

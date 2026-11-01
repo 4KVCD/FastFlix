@@ -560,11 +560,13 @@ def generate_all(
     # Detect source rotation for metadata clearing (FFmpeg auto-rotates during re-encoding)
     source_rotation_degrees = fastflix.current_video.source_rotation
 
+    output_path = fastflix.current_video.video_settings.output_path
     audio_cmd = (
         build_audio(
             fastflix.current_video.audio_tracks,
             # Video filters (including reverse) are not applied when disabled (copy), keep audio forward then
             reverse_video=fastflix.current_video.video_settings.reverse_video and not disable_filters,
+            output_suffix=output_path.suffix if output_path else "",
         )
         if audio
         else []

@@ -290,3 +290,86 @@ def test_build_audio_no_profile_when_none(sample_audio_tracks):
 
     assert _has_consecutive(result, "-c:0", "aac")
     assert "-profile:0" not in result
+
+
+def _opus_track(layout, channels, downmix=None):
+    from box import Box
+
+    from fastflix.models.encode import AudioTrack
+
+    return AudioTrack(
+        index=1,
+        outdex=1,
+        enabled=True,
+        conversion_codec="libopus",
+        conversion_bitrate="128",
+        downmix=downmix,
+        channels=channels,
+        raw_info=Box({"channel_layout": layout, "channels": channels}),
+    )
+
+
+def test_opus_channel_layout():
+    """libopus takes only mono, stereo, 3.0, quad, 5.0, 5.1, 6.1 and 7.1, and 5.0 and 6.1 come back with channels in
+    other positions: other layouts map to the smallest of the rest that holds their channels (LFE kept), more than
+    7.1 to 7.1, unknown names by channel count."""
+    from fastflix.encoders.common.audio import opus_channel_layout
+
+    expected = {
+        ("5.0", 5): "5.1",
+        ("6.1", 7): "7.1",
+        ("5.1(side)", 6): "5.1",
+        ("7.1", 8): "7.1",
+        ("stereo", 2): "stereo",
+        ("downmix", 2): "stereo",
+        ("2.1", 3): "5.1",
+        ("4.1", 5): "5.1",
+        ("7.0", 7): "7.1",
+        ("7.1.2", 10): "7.1",
+        ("7.1.4", 12): "7.1",
+        ("unknown", 6): "5.1",
+        (None, 1): "mono",
+    }
+    for (layout, channels), target in expected.items():
+        assert opus_channel_layout(layout, channels) == target, layout
+
+
+def test_build_audio_libopus_gets_a_layout_it_accepts():
+    """5.1(side) (most AC3/DTS 5.1 tracks) made libopus fail; the filter now asks for 5.1. A 7.1.4 downmix gives
+    -ac 8 with aformat 7.1, not -ac 12."""
+    command = build_audio([_opus_track("5.1(side)", 6)])
+    assert command[command.index("-filter:1") + 1] == "aformat=sample_fmts=flt:channel_layouts=5.1"
+    assert "-ac:1" not in command
+
+    command = build_audio([_opus_track("7.1", 8, downmix="7.1.4")])
+    assert command[command.index("-ac:1") + 1] == "8"
+    assert command[command.index("-filter:1") + 1] == "aformat=sample_fmts=flt:channel_layouts=7.1"
+
+
+def test_build_audio_other_codecs_keep_the_source_layout():
+    track = _opus_track("5.1(side)", 6)
+    track.conversion_codec = "aac"
+    command = build_audio([track])
+    assert command[command.index("-filter:1") + 1] == "aformat=channel_layouts=5.1(side)"
+
+
+def test_build_audio_copies_instead_of_opus_where_opus_cannot_go():
+    """.mov, .m4v, .avi and .m2ts outputs cannot hold Opus: a libopus conversion (the default) is copied there."""
+    command = build_audio([_opus_track("5.1(side)", 6)], output_suffix=".mov")
+    assert command[command.index("-c:1") + 1] == "copy"
+    command = build_audio([_opus_track("5.1(side)", 6)], output_suffix=".mkv")
+    assert command[command.index("-c:1") + 1] == "libopus"
+
+
+def test_build_audio_libopus_keeps_a_chosen_downmix():
+    """A downmix chosen without LFE (7.0) is applied first, then put into a layout libopus takes (7.1, LFE silent)."""
+    command = build_audio([_opus_track("7.1", 8, downmix="7.0")])
+    assert command[command.index("-filter:1") + 1] == (
+        "aformat=channel_layouts=7.0,aformat=sample_fmts=flt:channel_layouts=7.1"
+    )
+
+
+def test_build_audio_chosen_downmix_like_the_source_needs_no_extra_step():
+    """The conversion window preselects the source's layout; that gives one aformat, as with no downmix."""
+    command = build_audio([_opus_track("5.1(side)", 6, downmix="5.1(side)")])
+    assert command[command.index("-filter:1") + 1] == "aformat=sample_fmts=flt:channel_layouts=5.1"
