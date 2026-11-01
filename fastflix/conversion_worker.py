@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 import logging
-from pathlib import Path
 from queue import Empty, Full
 from typing import Literal
 from datetime import datetime
+from pathlib import Path
 
 import reusables
-from platformdirs import user_data_dir
 from pathvalidate import sanitize_filename
 
 from fastflix.command_runner import BackgroundRunner
+from fastflix.data_dir import fastflix_data_dir
 from fastflix.language import t
 
 
@@ -19,7 +19,7 @@ def file_date():
 
 logger = logging.getLogger("fastflix-core")
 
-log_path = Path(user_data_dir("FastFlix", appauthor=False, roaming=True)) / "logs"
+log_path = fastflix_data_dir() / "logs"
 
 
 @reusables.log_exception(log="fastflix-core")

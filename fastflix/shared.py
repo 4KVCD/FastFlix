@@ -9,7 +9,6 @@ from pathlib import Path
 from subprocess import run
 import platform
 
-from platformdirs import user_data_dir
 import importlib.resources
 import requests
 import reusables
@@ -18,6 +17,7 @@ from pathvalidate import sanitize_filepath
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from fastflix.data_dir import fastflix_data_dir
 from fastflix.language import t
 from fastflix.resources import clean_env, get_bool_env  # noqa: F401 (clean_env re-exported)
 
@@ -492,7 +492,7 @@ def get_config(portable_mode=False):
         return Path(config)
     if Path("fastflix.yaml").exists() or portable_mode:
         return Path("fastflix.yaml")
-    return Path(user_data_dir("FastFlix", appauthor=False, roaming=True)) / "fastflix.yaml"
+    return fastflix_data_dir() / "fastflix.yaml"
 
 
 def clear_list(the_list: list, close=False):

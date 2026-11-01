@@ -12,8 +12,9 @@ from pathlib import Path
 import importlib.resources
 
 from iso639 import Lang
-from platformdirs import user_data_dir
 from box import Box
+
+from fastflix.data_dir import fastflix_data_dir
 
 ref = importlib.resources.files("fastflix") / "data/languages.yaml"
 with importlib.resources.as_file(ref) as lf:
@@ -28,7 +29,7 @@ if config:
 elif Path("fastflix.yaml").exists():
     config = Path("fastflix.yaml")
 else:
-    config = Path(user_data_dir("FastFlix", appauthor=False, roaming=True)) / "fastflix.yaml"
+    config = fastflix_data_dir() / "fastflix.yaml"
 
 language = os.getenv("FF_LANG")
 

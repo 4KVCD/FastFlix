@@ -16,6 +16,7 @@ from box import Box
 from pydantic import BaseModel, Field, TypeAdapter
 from reusables import win_based
 
+from fastflix.data_dir import fastflix_data_dir
 from fastflix.exceptions import ConfigError, MissingFF
 from fastflix.models.encode import (
     x264Settings,
@@ -41,7 +42,7 @@ def get_config(portable_mode=False):
         return Path(config)
     if Path("fastflix.yaml").exists() or portable_mode:
         return Path("fastflix.yaml")
-    return Path(user_data_dir("FastFlix", appauthor=False, roaming=True)) / "fastflix.yaml"
+    return fastflix_data_dir() / "fastflix.yaml"
 
 
 def get_preset_defaults():
@@ -245,7 +246,7 @@ class Config(BaseModel):
     logging_level: int = 10
     crop_detect_points: int = 10
     continue_on_failure: bool = True
-    work_path: Path = Path(os.getenv("FF_WORKDIR", user_data_dir("FastFlix", appauthor=False, roaming=True)))
+    work_path: Path = Path(os.getenv("FF_WORKDIR", fastflix_data_dir()))
     use_sane_audio: bool = True
     selected_profile: str = "Standard Profile"
     theme: str = "onyx"

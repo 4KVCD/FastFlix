@@ -2,9 +2,9 @@
 from pathlib import Path
 from typing import Any
 
-from platformdirs import user_data_dir
 from pydantic import BaseModel, Field
 
+from fastflix.data_dir import fastflix_data_dir
 from fastflix.models.config import Config
 from fastflix.models.video import Video
 
@@ -22,9 +22,9 @@ class FastFlix(BaseModel):
     video_encoders: list[str] = None
     encoders: dict = None
     config: Config = None
-    data_path: Path = Path(user_data_dir("FastFlix", appauthor=False, roaming=True))
-    log_path: Path = Path(user_data_dir("FastFlix", appauthor=False, roaming=True)) / "logs"
-    queue_path: Path = Path(user_data_dir("FastFlix", appauthor=False, roaming=True)) / "queue.yaml"
+    data_path: Path = fastflix_data_dir()
+    log_path: Path = fastflix_data_dir() / "logs"
+    queue_path: Path = fastflix_data_dir() / "queue.yaml"
     ffmpeg_version: str = ""
     ffmpeg_config: list[str] = ""
     ffprobe_version: str = ""
