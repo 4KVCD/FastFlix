@@ -163,7 +163,9 @@ class EncodingMixin:
         prevent_sleep_mode()
         self.set_convert_button()
         self.send_video_request_to_worker_queue(video_to_send)
-        self.disable_all()
+        if not self.app.fastflix.current_video:
+            # A kept source stays editable while the queue runs: the queue holds its own copies.
+            self.disable_all()
         self.video_options.show_status()
         video_name = video_to_send.video_settings.video_title or video_to_send.video_settings.output_path.stem
         self.encoding_status_signal.emit(f"{t('Encoding')}: {video_name}", STATE_ENCODING)
@@ -186,7 +188,15 @@ class EncodingMixin:
             # The queued copy owns the current uuid and work_path; the kept source needs its own so the
             # next queue entry doesn't collide on status updates, removal, retry or temp file cleanup.
             refresh_video_identity(self.app.fastflix.current_video, self.get_temp_work_path())
+            self.new_output_name_for_kept_source()
         return True
+
+    def new_output_name_for_kept_source(self):
+        """A new name from the name template, so queueing the kept source again does not collide with the job just
+        queued ("out file is already in queue"). The chosen output folder stays."""
+        _, name = self.generate_output_filename
+        self.output_video_path_widget.setText(name)
+        self._update_truncation_warning()
 
     def conversion_complete(self, success: bool):
         self.paused = False

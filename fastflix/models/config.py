@@ -299,7 +299,7 @@ class Config(BaseModel):
     show_complete_message: bool = False
     play_complete_sound: bool = False
     show_error_message: bool = True
-    keep_source_after_encode: bool = False
+    keep_source_after_encode: bool = True
 
     disable_cover_extraction: bool = False
     suppress_ffmpeg_version_warning: bool = False

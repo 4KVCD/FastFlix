@@ -439,12 +439,10 @@ class EncodingQueue(FlixList):
             for track in self.tracks:
                 track.widgets.up_button.setDisabled(True)
                 track.widgets.down_button.setDisabled(True)
-                track.widgets.reload_button.setDisabled(True)
         else:
             for track in self.tracks:
                 track.widgets.up_button.setDisabled(False)
                 track.widgets.down_button.setDisabled(False)
-                track.widgets.reload_button.setDisabled(False)
             if self.tracks:
                 self.tracks[0].widgets.up_button.setDisabled(True)
                 self.tracks[-1].widgets.down_button.setDisabled(True)
@@ -497,14 +495,27 @@ class EncodingQueue(FlixList):
             # Queue is saved by new_source() -> reorder() -> save_queue_async()
 
     def reload_from_queue(self, video):
-        if self.app.fastflix.currently_encoding:
+        """Edit: load a queued job back as the source and take it out of the queue. Allowed during an encode for
+        any job but the running one (its Edit button is hidden too)."""
+        if video.status.running:
+            return
+        # The source stays loaded after Add to queue, so ask before replacing it, as opening a file does.
+        if self.app.fastflix.current_video and not yes_no_message(
+            t("Replace the loaded source and its settings with this queued job?"),
+            title="Edit queued job",
+        ):
             return
         try:
-            self.main.reload_video_from_queue(video)
+            # A copy, so a failed load never leaves the window and the queue sharing one object.
+            self.main.reload_video_from_queue(copy.deepcopy(video))
         except FastFlixInternalException:
-            pass
-        else:
-            self.remove_item(video)
+            return  # refused (and reported) before anything was loaded
+        except Exception as err:
+            # Already logged by reload_video_from_queue; drop the half-loaded source, keep the job queued.
+            self.main.clear_current_video()
+            error_message(f"{t('Could not load the queued job')}: {err}")
+            return
+        self.remove_item(video)
 
     def reset_pause_encode(self):
         self.pause_encode.setText(t("Pause Encode"))
