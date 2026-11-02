@@ -58,6 +58,10 @@ class StatusPanel(QtWidgets.QWidget):
         h_box.addWidget(self.time_elapsed_label)
         h_box.addWidget(self.size_label)
         h_box.addStretch(1)
+        self.settings_button = QtWidgets.QPushButton(t("Settings"))
+        self.settings_button.setToolTip(t("Settings and commands of the job that is encoding"))
+        self.settings_button.clicked.connect(lambda: self.main.video_options.queue.show_running_job_settings())
+        h_box.addWidget(self.settings_button)
         h_box.addWidget(self.hide_nal, alignment=QtCore.Qt.AlignRight)
 
         layout.addLayout(h_box, 0, 0)

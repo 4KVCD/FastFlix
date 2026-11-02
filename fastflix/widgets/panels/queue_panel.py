@@ -24,6 +24,7 @@ from fastflix.exceptions import FastFlixInternalException
 from fastflix.windows_tools import allow_sleep_mode, prevent_sleep_mode
 from fastflix.command_runner import BackgroundRunner
 from fastflix.widgets.toggle_switch import ToggleSwitch
+from fastflix.widgets.windows.job_settings import JobSettingsWindow
 
 logger = logging.getLogger("fastflix")
 
@@ -114,6 +115,9 @@ class EncodeItem(QtWidgets.QTabWidget):
             retry_button=QtWidgets.QPushButton(
                 QtGui.QIcon(get_icon("undo", self.parent.app.fastflix.config.theme)), ""
             ),
+            settings_button=QtWidgets.QPushButton(
+                QtGui.QIcon(get_icon("info", self.parent.app.fastflix.config.theme)), ""
+            ),
         )
 
         for widget in self.widgets.values():
@@ -171,6 +175,12 @@ class EncodeItem(QtWidgets.QTabWidget):
             self.widgets.cancel_button.hide()
             self.widgets.reload_button.hide()
 
+        # Every job, the running one too: a read-only view of its settings and commands.
+        self.widgets.settings_button.setToolTip(t("Settings"))
+        self.widgets.settings_button.clicked.connect(lambda: self.parent.show_job_settings(self.video))
+        self.widgets.settings_button.setFixedWidth(scaler.scale(20))
+        self.widgets.settings_button.setIconSize(scaler.scale_size(12, 12))
+
         grid = QtWidgets.QGridLayout()
         grid.addLayout(self.init_move_buttons(), 0, 0)
         # grid.addWidget(self.widgets.track_number, 0, 1)
@@ -193,6 +203,7 @@ class EncodeItem(QtWidgets.QTabWidget):
             self.widgets.retry_button.clicked.connect(lambda: self.parent.retry_video(self.video))
 
         right_buttons = QtWidgets.QHBoxLayout()
+        right_buttons.addWidget(self.widgets.settings_button)
         right_buttons.addWidget(self.widgets.reload_button)
         right_buttons.addWidget(self.widgets.cancel_button)
 
@@ -493,6 +504,16 @@ class EncodingQueue(FlixList):
         if not part_of_clear:
             self.new_source()
             # Queue is saved by new_source() -> reorder() -> save_queue_async()
+
+    def show_job_settings(self, video):
+        JobSettingsWindow(video, parent=self.main).show()
+
+    def show_running_job_settings(self):
+        running = next((v for v in self.app.fastflix.conversion_list if v.status.running), None)
+        if running is None:
+            message(t("Nothing is encoding"))
+            return
+        self.show_job_settings(running)
 
     def reload_from_queue(self, video):
         """Edit: load a queued job back as the source and take it out of the queue. Allowed during an encode for
