@@ -357,3 +357,39 @@ def test_vvc_grain_strength_and_speed_options():
 def test_vvc_ffmpeg_used_for_vvc_encodes():
     cmd = _build_with_settings(vvc_ffmpeg=Path("C:/w/ffvvc/ffmpeg.exe"))[0].command
     assert cmd[0] == str(Path("C:/w/ffvvc/ffmpeg.exe"))
+
+
+def test_vvc_grain_tune_comes_first_and_owns_its_keys():
+    """Tune=grain first; FastFlix's BIM, CU-tree picture QPs and MCTF tilt would undo it; the sliders override it.
+    fga is left out: it runs inside MCTF, which the tune turns off (VVenC refuses the pair)."""
+    cmd = _build_with_settings(
+        tune_grain=True, psy_rd=0.5, psy_rdoq=0.0, level_lambda=0.7, vvc_params=["IntraQPOffset=0"]
+    )[0].command
+    assert _param_list(cmd) == [
+        "Tune=grain",
+        "CuTreeLookAheadGOPs=4",
+        "AdaptiveIntra=1",
+        "DecodingRefreshType=cra",
+        "NumParallelGOPs=4",
+        "PsyRD=0.5",
+        "PsyRDOQ=0",
+        "LevelLambda=0.7",
+        "IntraQPOffset=0",
+    ]
+    assert "-qpa" not in cmd  # the tune turns QPA off itself
+    # bitrate mode takes the tune too
+    rate = _param_list(_build_with_settings(qp=None, bitrate="6000k", tune_grain=True, psy_rd=1.0)[1].command)
+    assert rate[0] == "Tune=grain" and "PsyRD=1" in rate and "BIM=1" not in rate
+    # capped QP (a maxrate in QP mode) refuses the tune's CU-tree picture QPs: the greyed-out tune is not sent and
+    # FastFlix's own keys stay; the sliders still apply
+    capped = _param_list(_build_with_settings(maxrate=8000, tune_grain=True, psy_rd=1.0)[0].command)
+    assert "Tune=grain" not in capped and "BIM=1" in capped and "MCTFLevelTilt=100" in capped and "fga=2" in capped
+    assert capped[-1] == "PsyRD=1"
+
+
+def test_vvc_psy_without_tune_keeps_qpa_and_flat_inter_qp_turns_it_off():
+    cmd = _build_with_settings(psy_rd=1.0, psy_rdoq=0.25)[0].command
+    assert _param_list(cmd)[-2:] == ["PsyRD=1", "PsyRDOQ=0.25"]
+    assert "-qpa" not in cmd  # PsyRD and PsyRDOQ combine with QPA
+    flat = _build_with_settings(flat_inter_qp=True)[0].command
+    assert flat[flat.index("-qpa") + 1] == "0" and _param_list(flat)[-1] == "FlatInterQP=1"

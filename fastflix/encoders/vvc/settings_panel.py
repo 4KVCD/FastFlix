@@ -39,6 +39,29 @@ MAX_QP = 63
 MIN_GRAIN_STRENGTH = 1  # percent; 0 would signal no grain after running the whole analysis
 MAX_GRAIN_STRENGTH = 399  # VVenC's fgastrength is below 4.0
 
+PSY_SLIDER_STEPS_PER_UNIT = 20  # the psy sliders move in steps of 0.05
+PSY_SLIDER_MAX = 3.0  # VVenC takes up to 3.98; past about 2 the defects (streaks, patchy grain) outweigh the grain kept
+TUNE_PSY_VALUE = 1.0  # what Tune=grain sets for PsyRD and PsyRDOQ
+MAX_LEVEL_LAMBDA = 3.98
+
+PSY_RD_TIP = (
+    "PsyRD: keeps the source's fine texture and film grain instead of smoothing it away.\n"
+    "Higher keeps more grain at the same QP and costs more bytes; past a point it brings visible defects\n"
+    "(brush-stroke streaks, patchy grain). Off = stock VVenC. 1.0 is recommended for film grain,\n"
+    "0.5 is lighter (fewer defects), 2.0 keeps the most."
+)
+PSY_RDOQ_TIP = (
+    "PsyRDOQ: the quantizer keeps grain coefficients in I pictures, on the same scale as Psy-RD.\n"
+    "Useful on film grain; on clean digital video it is the main source of brush-stroke streaks."
+)
+TUNE_GRAIN_TIP = (
+    "Tune=grain: VVenC's preset for grainy film. It sets Psy-RD and Psy-RDOQ to 1.0 and its own\n"
+    "block importance, CU-tree picture QPs, filters and QPA, and turns MCTF off,\n"
+    "so those settings above are greyed while it is on. The sliders still override it.\n"
+    "Film grain analysis needs MCTF, so it is off with the tune."
+)
+CAPPED_QP_TIP = "Not with a maxrate in QP mode: VVenC refuses the tune's CU-tree picture QPs there"
+
 # Combos whose items carry their setting's value: (setting name, label, [(item text, value)], tooltip).
 # The setting name is also the widget name.
 value_combos = [
@@ -177,20 +200,27 @@ class VVC(SettingPanel):
         grid.addLayout(self.init_fga_strength(), 9, 2, 1, 4)
         grid.addLayout(combos["mctf_level_tilt"], 10, 0, 1, 2)
 
-        grid.addLayout(section_title("Speed"), 11, 0, 1, 6)
-        grid.addLayout(combos["threads"], 12, 0, 1, 2)
-        grid.addLayout(combos["num_parallel_gops"], 12, 2, 1, 4)
-        grid.addLayout(combos["ifp"], 13, 0, 1, 2)
-        grid.addLayout(self.init_same_output_any_threads(), 13, 2, 1, 4)
+        grid.addLayout(section_title("Grain / detail retention"), 11, 0, 1, 6)
+        grid.addLayout(self.init_tune_grain(), 12, 0, 1, 2)
+        grid.addLayout(self.init_psy_slider("psy_rd", "Psy-RD", PSY_RD_TIP), 12, 2, 1, 4)
+        grid.addLayout(self.init_psy_slider("psy_rdoq", "Psy-RDOQ", PSY_RDOQ_TIP), 13, 2, 1, 4)
 
-        grid.addLayout(section_title("Advanced"), 14, 0, 1, 6)
-        grid.addLayout(self.init_subjopt(), 15, 0, 1, 2)
-        grid.addLayout(self.init_vvc_params(), 15, 2, 1, 4)
-        grid.addLayout(self.init_max_mux(), 16, 0, 1, 2)
+        grid.addLayout(section_title("Speed"), 14, 0, 1, 6)
+        grid.addLayout(combos["threads"], 15, 0, 1, 2)
+        grid.addLayout(combos["num_parallel_gops"], 15, 2, 1, 4)
+        grid.addLayout(combos["ifp"], 16, 0, 1, 2)
+        grid.addLayout(self.init_same_output_any_threads(), 16, 2, 1, 4)
 
-        grid.setRowStretch(17, True)
+        grid.addLayout(section_title("Advanced"), 17, 0, 1, 6)
+        grid.addLayout(self.init_subjopt(), 18, 0, 1, 2)
+        grid.addLayout(self.init_vvc_params(), 18, 2, 1, 4)
+        grid.addLayout(self.init_max_mux(), 19, 0, 1, 2)
+        grid.addLayout(self.init_level_lambda(), 20, 0, 1, 2)
+        grid.addLayout(self.init_flat_inter_qp(), 20, 2, 1, 4)
 
-        grid.addLayout(self._add_custom(), 18, 0, 1, 6)
+        grid.setRowStretch(21, True)
+
+        grid.addLayout(self._add_custom(), 22, 0, 1, 6)
 
         self.setLayout(grid)
         self.update_dependent_options()
@@ -313,6 +343,131 @@ class VVC(SettingPanel):
             opt="same_output_any_threads",
         )
 
+    def init_tune_grain(self):
+        layout = self._add_check_box(
+            label="Tune for film grain",
+            tooltip=TUNE_GRAIN_TIP,
+            widget_name="tune_grain",
+            opt="tune_grain",
+            connect=lambda: self.value_combo_changed(),
+        )
+        # clicked, not toggled: only the user's tick moves the sliders, not a profile or queue restore
+        self.widgets.tune_grain.clicked.connect(lambda checked: checked and self.set_psy_sliders(TUNE_PSY_VALUE))
+        return layout
+
+    def init_psy_slider(self, name, label, tooltip):
+        """A 0-3 slider in steps of 0.05 with a label showing Off or the value. Kept out of self.opts (the shared
+        restore code has no sliders); restored by show_psy_settings."""
+        layout = QtWidgets.QHBoxLayout()
+        self.labels[name] = QtWidgets.QLabel(t(label))
+        self.labels[name].setToolTip(self.translate_tip(tooltip))
+        slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        slider.setRange(0, round(PSY_SLIDER_MAX * PSY_SLIDER_STEPS_PER_UNIT))
+        slider.setTickPosition(QtWidgets.QSlider.TickPosition.TicksBelow)
+        slider.setTickInterval(PSY_SLIDER_STEPS_PER_UNIT)  # a tick at every whole value, 1.0 recommended
+        slider.setToolTip(self.translate_tip(tooltip))
+        value_label = QtWidgets.QLabel()
+        value_label.setFixedWidth(40)
+        self.widgets[name] = slider
+        self.labels[f"{name}_value"] = value_label
+        slider.valueChanged.connect(lambda: self.psy_slider_changed(name))
+        self.set_psy_slider(name, self.app.fastflix.config.encoder_opt(self.profile_name, name))
+        layout.addWidget(self.labels[name])
+        layout.addWidget(slider, stretch=1)
+        layout.addWidget(value_label)
+        return layout
+
+    def psy_value(self, name) -> float:
+        return self.widgets[name].value() / PSY_SLIDER_STEPS_PER_UNIT
+
+    def show_psy_value(self, name):
+        value = self.psy_value(name)
+        self.labels[f"{name}_value"].setText(f"{value:g}" if value else t("Off"))
+
+    def set_psy_slider(self, name, value):
+        slider = self.widgets[name]
+        slider.blockSignals(True)
+        slider.setValue(round((value or 0) * PSY_SLIDER_STEPS_PER_UNIT))
+        slider.blockSignals(False)
+        self.show_psy_value(name)
+
+    def set_psy_sliders(self, value):
+        for name in ("psy_rd", "psy_rdoq"):
+            self.set_psy_slider(name, value)
+        self.main.page_update(build_thumbnail=False)
+
+    def psy_slider_changed(self, name):
+        self.show_psy_value(name)
+        self.main.page_update(build_thumbnail=False)
+
+    def init_level_lambda(self):
+        layout = QtWidgets.QHBoxLayout()
+        tooltip = (
+            "LevelLambda: below 1 keeps small coefficients (fine texture) more often. Empty = the encoder's 1.0,\n"
+            "or the tune's 0.5 with the film grain tune."
+        )
+        self.labels.level_lambda = QtWidgets.QLabel(t("Level lambda"))
+        self.labels.level_lambda.setToolTip(self.translate_tip(tooltip))
+        self.widgets.level_lambda = QtWidgets.QLineEdit()
+        self.widgets.level_lambda.setFixedWidth(60)
+        self.widgets.level_lambda.setToolTip(self.translate_tip(tooltip))
+        validator = QtGui.QDoubleValidator(0, MAX_LEVEL_LAMBDA, 2)
+        validator.setLocale(QtCore.QLocale.c())  # a dot as the decimal separator
+        self.widgets.level_lambda.setValidator(validator)
+        self.show_level_lambda(self.app.fastflix.config.encoder_opt(self.profile_name, "level_lambda"))
+        self.widgets.level_lambda.textChanged.connect(lambda: self.main.page_update(build_thumbnail=False))
+        layout.addWidget(self.labels.level_lambda)
+        layout.addWidget(self.widgets.level_lambda)
+        layout.addStretch(1)
+        return layout
+
+    def show_level_lambda(self, value):
+        self.widgets.level_lambda.blockSignals(True)
+        self.widgets.level_lambda.setText("" if value is None else f"{value:g}")
+        self.widgets.level_lambda.blockSignals(False)
+
+    def level_lambda(self):
+        """The typed LevelLambda, or None (the encoder's value) while empty or out of VVenC's (0, 3.98] range."""
+        try:
+            value = float(self.widgets.level_lambda.text())
+        except ValueError:
+            return None
+        return value if 0 < value <= MAX_LEVEL_LAMBDA else None
+
+    def init_flat_inter_qp(self):
+        layout = QtWidgets.QHBoxLayout()
+        tooltip = (
+            "FlatInterQP: the same QP for all inter pictures (the film grain tune turns it on).\n"
+            "VVenC needs Perceptual QPA off for it, so On also turns QPA off."
+        )
+        self.labels.flat_inter_qp = QtWidgets.QLabel(t("Flat inter QPs"))
+        self.labels.flat_inter_qp.setToolTip(self.translate_tip(tooltip))
+        combo = QtWidgets.QComboBox()
+        for text in ("Default", "On", "Off"):
+            combo.addItem(t(text))
+        combo.setToolTip(self.translate_tip(tooltip))
+        self.widgets.flat_inter_qp = combo
+        self.show_flat_inter_qp(self.app.fastflix.config.encoder_opt(self.profile_name, "flat_inter_qp"))
+        combo.currentIndexChanged.connect(lambda: self.main.page_update(build_thumbnail=False))
+        layout.addWidget(self.labels.flat_inter_qp)
+        layout.addWidget(combo)
+        return layout
+
+    def show_flat_inter_qp(self, value):
+        self.widgets.flat_inter_qp.blockSignals(True)
+        self.widgets.flat_inter_qp.setCurrentIndex(0 if value is None else (1 if value else 2))
+        self.widgets.flat_inter_qp.blockSignals(False)
+
+    def flat_inter_qp(self):
+        return {0: None, 1: True, 2: False}[self.widgets.flat_inter_qp.currentIndex()]
+
+    def show_psy_settings(self, value_of):
+        """Restore the grain widgets that the shared restore code does not handle (the tune checkbox it does)."""
+        for name in ("psy_rd", "psy_rdoq"):
+            self.set_psy_slider(name, value_of(name))
+        self.show_level_lambda(value_of("level_lambda"))
+        self.show_flat_inter_qp(value_of("flat_inter_qp"))
+
     def init_subjopt(self):
         return self._add_check_box(
             label="Perceptual QPA",
@@ -366,16 +521,28 @@ class VVC(SettingPanel):
         """Grey out the options VVenC refuses or ignores with the other settings. Only a hint: the maxrate is set on
         another tab, so the command builder's is_constant_qp is what keeps refused options out of the command."""
         video = self.app.fastflix.current_video
-        rate_control = self.mode.lower() == "bitrate" or bool(video and video.video_settings.maxrate)
+        bitrate_mode = self.mode.lower() == "bitrate"
+        rate_control = bitrate_mode or bool(video and video.video_settings.maxrate)
+        # VVenC refuses the tune's CU-tree picture QPs with a maxrate in QP mode (capped QP)
+        capped_qp = rate_control and not bitrate_mode
+        self.widgets.tune_grain.setEnabled(not capped_qp)
+        self.widgets.tune_grain.setToolTip(self.translate_tip(CAPPED_QP_TIP if capped_qp else TUNE_GRAIN_TIP))
+        # The tune decides these itself; a greyed-out tune (capped QP) is not sent and leaves them to FastFlix
+        tune = self.widgets.tune_grain.isChecked() and not capped_qp
         cutree = self.widgets.bim.currentData() == 1
-        picture_qps = not rate_control and cutree
+        picture_qps = not rate_control and cutree and not tune
+        self.widgets.bim.setEnabled(not tune)
         self.widgets.cutree_pic_strength.setEnabled(picture_qps)
-        # The look-ahead only pays together with the picture QPs, so the builder sends it only with them
+        # The look-ahead only pays together with the picture QPs (the tune turns them on), so it is sent only with them
         self.widgets.cutree_lookahead_gops.setEnabled(
-            picture_qps and self.widgets.cutree_pic_strength.currentData() > 0
+            tune or (picture_qps and self.widgets.cutree_pic_strength.currentData() > 0)
         )
+        self.widgets.mctf_level_tilt.setEnabled(not tune)
+        self.widgets.subjopt.setEnabled(not tune)
         self.widgets.num_parallel_gops.setEnabled(not rate_control)
-        self.widgets.fga_strength.setEnabled(self.widgets.fga.currentData() != 0)
+        # Film grain analysis runs inside MCTF, which the tune turns off: VVenC refuses fga with it
+        self.widgets.fga.setEnabled(not tune)
+        self.widgets.fga_strength.setEnabled(not tune and self.widgets.fga.currentData() != 0)
 
     def setting_change(self, update=True, pix_change=False):
         if self.updating_settings or not self.main.input_video:
@@ -429,6 +596,11 @@ class VVC(SettingPanel):
             subjopt=self.widgets.subjopt.isChecked(),
             same_output_any_threads=self.widgets.same_output_any_threads.isChecked(),
             fga_strength=fga_strength,
+            tune_grain=self.widgets.tune_grain.isChecked(),
+            psy_rd=self.psy_value("psy_rd"),
+            psy_rdoq=self.psy_value("psy_rdoq"),
+            level_lambda=self.level_lambda(),
+            flat_inter_qp=self.flat_inter_qp(),
             **{name: self.widgets[name].currentData() for name, *_ in value_combos},
         )
 
@@ -440,6 +612,7 @@ class VVC(SettingPanel):
     def update_profile(self):
         super().update_profile()
         self.show_value_combos(lambda name: self.app.fastflix.config.encoder_opt(self.profile_name, name))
+        self.show_psy_settings(lambda name: self.app.fastflix.config.encoder_opt(self.profile_name, name))
         self.widgets.custom_qp.setText(qp_text(self.app.fastflix.config.encoder_opt(self.profile_name, "qp")))
         self.update_dependent_options()
 
@@ -447,6 +620,7 @@ class VVC(SettingPanel):
         super().reload()
         settings = self.app.fastflix.current_video.video_settings.video_encoder_settings
         self.show_value_combos(lambda name: getattr(settings, name))
+        self.show_psy_settings(lambda name: getattr(settings, name))
         self.widgets.custom_qp.setText(qp_text(settings.qp))
         self.update_dependent_options()
 

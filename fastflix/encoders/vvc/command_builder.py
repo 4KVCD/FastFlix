@@ -19,28 +19,70 @@ from fastflix.models.fastflix import FastFlix
 
 
 def is_constant_qp(fastflix: FastFlix) -> bool:
-    """QP mode without a maxrate: VVenC refuses CuTreePicStrength and NumParallelGOPs > 0 under any rate control."""
+    """QP mode without a maxrate. FastFlix's own CuTreePicStrength and NumParallelGOPs go only here: VVenC refuses
+    NumParallelGOPs > 0 and capped-QP CuTreePicStrength under rate control."""
     settings: VVCSettings = fastflix.current_video.video_settings.video_encoder_settings
     return settings.qp is not None and not settings.bitrate and not fastflix.current_video.video_settings.maxrate
+
+
+def is_capped_qp(settings: VVCSettings, constant_qp: bool) -> bool:
+    """QP mode with a maxrate (capped CQF), the one rate mode where VVenC refuses the tune's CU-tree picture QPs."""
+    return not constant_qp and not settings.bitrate
+
+
+def tune_active(settings: VVCSettings, constant_qp: bool) -> bool:
+    """Tune=grain is sent: ticked and not capped QP. A greyed-out tune changes nothing, FastFlix's own keys stay."""
+    return settings.tune_grain and not is_capped_qp(settings, constant_qp)
+
+
+def flat_inter_qp_needs_qpa_off(settings: VVCSettings, constant_qp: bool) -> bool:
+    """FlatInterQP=1 sent without the tune: VVenC refuses it with QPA on (the tune turns QPA off itself).
+    PsyRD and PsyRDOQ combine with QPA."""
+    return not tune_active(settings, constant_qp) and settings.flat_inter_qp is True
+
+
+def psy_params(settings: VVCSettings, constant_qp: bool) -> list[str]:
+    """PsyRD, PsyRDOQ, LevelLambda and FlatInterQP, in every rate mode; they follow Tune=grain, so they override
+    what it set."""
+    params = []
+    # With the tune on, both are always sent: the user may have moved a slider off the tune's 1.0, even to 0
+    tune = tune_active(settings, constant_qp)
+    if tune or settings.psy_rd > 0:
+        params.append(f"PsyRD={settings.psy_rd:g}")
+    if tune or settings.psy_rdoq > 0:
+        params.append(f"PsyRDOQ={settings.psy_rdoq:g}")
+    if settings.level_lambda is not None:
+        params.append(f"LevelLambda={settings.level_lambda:g}")
+    if settings.flat_inter_qp is not None:
+        params.append(f"FlatInterQP={int(settings.flat_inter_qp)}")
+    return params
 
 
 def generated_vvenc_params(settings: VVCSettings, constant_qp: bool) -> list[str]:
     """The VVenC Key=Value options FastFlix sets from its panel."""
     params = []
+    tune = tune_active(settings, constant_qp)
+    if tune:
+        params.append("Tune=grain")  # first: everything after it overrides the tune
     qp_mode = settings.qp is not None and not settings.bitrate
     if qp_mode and not float(settings.qp).is_integer():
         params.append(f"QP={float(settings.qp):g}")
-    params.append(f"BIM={settings.bim}")
-    # The longer look-ahead only pays together with the picture QPs, so it is sent only with them
-    if constant_qp and settings.bim == 1 and settings.cutree_pic_strength:
-        params.append(f"CuTreePicStrength={settings.cutree_pic_strength}")
+    # The tune sets block importance, the CU-tree picture QPs and MCTF itself; FastFlix's values would undo it.
+    # The longer look-ahead only pays together with the picture QPs, so it is sent only with them (the tune's too).
+    if tune:
         params.append(f"CuTreeLookAheadGOPs={settings.cutree_lookahead_gops}")
+    else:
+        params.append(f"BIM={settings.bim}")
+        if constant_qp and settings.bim == 1 and settings.cutree_pic_strength:
+            params.append(f"CuTreePicStrength={settings.cutree_pic_strength}")
+            params.append(f"CuTreeLookAheadGOPs={settings.cutree_lookahead_gops}")
     if settings.adaptive_intra:
         params.append("AdaptiveIntra=1")
     params.append(f"DecodingRefreshType={settings.refresh_type}")
-    if settings.mctf_level_tilt:
+    if settings.mctf_level_tilt and not tune:
         params.append(f"MCTFLevelTilt={settings.mctf_level_tilt}")
-    if settings.fga:
+    # Film grain analysis runs inside MCTF, which the tune turns off: VVenC refuses fga with the tune
+    if settings.fga and not tune:
         params.append(f"fga={settings.fga}")
         if settings.fga_strength != 100:
             params.append(f"fgastrength={settings.fga_strength / 100:g}")
@@ -50,7 +92,7 @@ def generated_vvenc_params(settings: VVCSettings, constant_qp: bool) -> list[str
         params.append(f"NumParallelGOPs={settings.num_parallel_gops}")
     if settings.same_output_any_threads:
         params.append("mtprofile=0")
-    return params
+    return params + psy_params(settings, constant_qp)
 
 
 def build(fastflix: FastFlix):
@@ -66,7 +108,8 @@ def build(fastflix: FastFlix):
     if settings.levelidc:
         beginning.extend(["-level", settings.levelidc])
 
-    if not settings.subjopt:
+    constant_qp = is_constant_qp(fastflix)
+    if not settings.subjopt or flat_inter_qp_needs_qpa_off(settings, constant_qp):
         beginning.extend(["-qpa", "0"])
 
     beginning.extend(["-period", str(settings.period)])
@@ -74,7 +117,7 @@ def build(fastflix: FastFlix):
     if settings.threads > 0:
         beginning.extend(["-threads", str(settings.threads)])
 
-    vvc_params = generated_vvenc_params(settings, constant_qp=is_constant_qp(fastflix))
+    vvc_params = generated_vvenc_params(settings, constant_qp=constant_qp)
 
     if not fastflix.current_video.video_settings.remove_hdr:
         # Color primaries/transfer/matrix via FFmpeg flags (libvvenc reads these for VUI)
