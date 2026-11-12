@@ -43,6 +43,7 @@ PSY_SLIDER_STEPS_PER_UNIT = 20  # the psy sliders move in steps of 0.05
 PSY_SLIDER_MAX = 3.0  # VVenC takes up to 3.98; past about 2 the defects (streaks, patchy grain) outweigh the grain kept
 TUNE_PSY_VALUE = 1.0  # what Tune=grain sets for PsyRD and PsyRDOQ
 MAX_LEVEL_LAMBDA = 3.98
+QWIDGETSIZE_MAX = 16777215  # Qt's "no maximum" widget size (PySide6 does not export the constant)
 
 PSY_RD_TIP = (
     "PsyRD: keeps the source's fine texture and film grain instead of smoothing it away.\n"
@@ -161,6 +162,15 @@ def section_title(title):
     return layout
 
 
+def column(*layouts):
+    """The layouts stacked top-down, pushed to the top of their grid cell."""
+    stack = QtWidgets.QVBoxLayout()
+    for layout in layouts:
+        stack.addLayout(layout)
+    stack.addStretch(1)
+    return stack
+
+
 def qp_text(qp):
     return f"{qp:g}" if qp is not None else str(DEFAULT_QP)
 
@@ -181,46 +191,53 @@ class VVC(SettingPanel):
         self.updating_settings = False
         self.extract_thread = None
 
-        grid.addLayout(self.init_preset(), 0, 0, 1, 2)
-        grid.addLayout(self.init_tier(), 1, 0, 1, 2)
-        grid.addLayout(self.init_levels(), 2, 0, 1, 2)
-        grid.addLayout(self.init_pix_fmt(), 3, 0, 1, 2)
-        grid.addLayout(self.init_modes(), 0, 2, 5, 4)
+        # Three columns of sections side by side: the panel is wide and short in the normal window size
+        grid.addLayout(column(self.init_preset(), self.init_pix_fmt()), 0, 0)
+        grid.addLayout(column(self.init_tier(), self.init_levels()), 0, 1)
+        grid.addLayout(self.init_modes(), 0, 2)
 
         combos = {name: self._add_value_combo(name, label, choices, tip) for name, label, choices, tip in value_combos}
 
-        grid.addLayout(section_title("Compression"), 5, 0, 1, 6)
-        grid.addLayout(combos["bim"], 6, 0, 1, 2)
-        grid.addLayout(combos["adaptive_intra"], 6, 2, 1, 4)
-        grid.addLayout(combos["cutree_pic_strength"], 7, 0, 1, 2)
-        grid.addLayout(combos["period"], 7, 2, 1, 4)
-        grid.addLayout(combos["cutree_lookahead_gops"], 8, 0, 1, 2)
-        grid.addLayout(combos["refresh_type"], 8, 2, 1, 4)
-        grid.addLayout(combos["fga"], 9, 0, 1, 2)
-        grid.addLayout(self.init_fga_strength(), 9, 2, 1, 4)
-        grid.addLayout(combos["mctf_level_tilt"], 10, 0, 1, 2)
+        compression = column(
+            section_title("Compression"),
+            *(
+                combos[name]
+                for name in (
+                    "bim",
+                    "cutree_pic_strength",
+                    "cutree_lookahead_gops",
+                    "adaptive_intra",
+                    "period",
+                    "refresh_type",
+                    "mctf_level_tilt",
+                )
+            ),
+        )
+        grain = column(
+            section_title("Grain / detail retention"),
+            self.init_tune_grain(),
+            self.init_psy_slider("psy_rd", "Psy-RD", PSY_RD_TIP),
+            self.init_psy_slider("psy_rdoq", "Psy-RDOQ", PSY_RDOQ_TIP),
+            self.init_level_lambda(),
+            self.init_flat_inter_qp(),
+            combos["fga"],
+            self.init_fga_strength(),
+        )
+        speed_and_advanced = column(
+            section_title("Speed"),
+            *(combos[name] for name in ("threads", "num_parallel_gops", "ifp")),
+            self.init_same_output_any_threads(),
+            section_title("Advanced"),
+            self.init_subjopt(),
+            self.init_max_mux(),
+        )
+        for index, section in enumerate((compression, grain, speed_and_advanced)):
+            grid.addLayout(section, 1, index)
+            grid.setColumnStretch(index, 1)
 
-        grid.addLayout(section_title("Grain / detail retention"), 11, 0, 1, 6)
-        grid.addLayout(self.init_tune_grain(), 12, 0, 1, 2)
-        grid.addLayout(self.init_psy_slider("psy_rd", "Psy-RD", PSY_RD_TIP), 12, 2, 1, 4)
-        grid.addLayout(self.init_psy_slider("psy_rdoq", "Psy-RDOQ", PSY_RDOQ_TIP), 13, 2, 1, 4)
-
-        grid.addLayout(section_title("Speed"), 14, 0, 1, 6)
-        grid.addLayout(combos["threads"], 15, 0, 1, 2)
-        grid.addLayout(combos["num_parallel_gops"], 15, 2, 1, 4)
-        grid.addLayout(combos["ifp"], 16, 0, 1, 2)
-        grid.addLayout(self.init_same_output_any_threads(), 16, 2, 1, 4)
-
-        grid.addLayout(section_title("Advanced"), 17, 0, 1, 6)
-        grid.addLayout(self.init_subjopt(), 18, 0, 1, 2)
-        grid.addLayout(self.init_vvc_params(), 18, 2, 1, 4)
-        grid.addLayout(self.init_max_mux(), 19, 0, 1, 2)
-        grid.addLayout(self.init_level_lambda(), 20, 0, 1, 2)
-        grid.addLayout(self.init_flat_inter_qp(), 20, 2, 1, 4)
-
-        grid.setRowStretch(21, True)
-
-        grid.addLayout(self._add_custom(), 22, 0, 1, 6)
+        grid.addLayout(self.init_vvc_params(), 2, 0, 1, 3)
+        grid.setRowStretch(3, True)
+        grid.addLayout(self._add_custom(), 4, 0, 1, 3)
 
         self.setLayout(grid)
         self.update_dependent_options()
@@ -336,7 +353,7 @@ class VVC(SettingPanel):
 
     def init_same_output_any_threads(self):
         return self._add_check_box(
-            label="Same output at any thread count",
+            label="Same output, any threads",
             tooltip="mtprofile=0: VVenC's automatic multi-threading (tiles, IFP) is off,\n"
             "so the output does not depend on the number of threads.",
             widget_name="same_output_any_threads",
@@ -486,13 +503,46 @@ class VVC(SettingPanel):
         )
 
     def init_modes(self):
-        layout = self._add_modes(recommended_bitrates, ["Custom"], qp_name="qp", qp_text_box_only=True)
+        # The shared code creates the mode widgets and their logic; rate_grid lays them out. Its layout is kept until
+        # then: dropping it deletes its group boxes and every widget still in them.
+        shared_layout = self._add_modes(recommended_bitrates, ["Custom"], qp_name="qp", qp_text_box_only=True)
         qp_validator = QtGui.QDoubleValidator(0, MAX_QP, 2)
         qp_validator.setLocale(QtCore.QLocale.c())  # a dot as the decimal separator
         self.widgets.custom_qp.setValidator(qp_validator)
         self.widgets.custom_qp.setToolTip(t("QP 0-63; decimals such as 27.5 encode between two QPs"))
         self.widgets.custom_qp.setText(qp_text(self.app.fastflix.config.encoder_opt(self.profile_name, "qp")))
-        return layout
+        grid = self.rate_grid()
+        del shared_layout
+        return grid
+
+    def rate_grid(self):
+        """The QP and bitrate rows in one grid (radio | bitrate preset | "Custom:" | value | unit), so the two value
+        boxes line up and each row is one control tall next to the preset and bit depth rows. The shared _add_modes
+        puts each row in its own padded group box, which needs more height and leaves the boxes unaligned."""
+        grid = QtWidgets.QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        rows = (
+            (self.qp_radio, None, None, self.widgets.custom_qp, None),
+            (
+                self.bitrate_radio,
+                self.widgets.bitrate,
+                QtWidgets.QLabel(t("Custom") + ":"),
+                self.widgets.custom_bitrate,
+                QtWidgets.QLabel("k"),
+            ),
+        )
+        for row, widgets in enumerate(rows):
+            for col, widget in enumerate(widgets):
+                if widget is not None:
+                    # Out of _add_modes' group box (discarded with its layout) into this panel
+                    widget.setParent(self)
+                    grid.addWidget(widget, row, col)
+        for radio in (self.qp_radio, self.bitrate_radio):
+            # _add_modes fixes their width; in a shared column they take the width of "Bitrate" instead
+            radio.setMinimumWidth(0)
+            radio.setMaximumWidth(QWIDGETSIZE_MAX)
+        grid.setColumnStretch(1, 1)
+        return grid
 
     def mode_update(self):
         self.widgets.custom_bitrate.setDisabled(self.widgets.bitrate.currentText() != "Custom")
