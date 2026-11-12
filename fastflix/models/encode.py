@@ -169,6 +169,8 @@ class VVCSettings(EncoderSettings):
     fga_strength: int = 100  # percent of the analysed grain, 1-399
     num_parallel_gops: int = 4  # GOPs encoded at once at constant QP (faster, more RAM); -1 = VVenC's own choice
     same_output_any_threads: bool = False  # mtprofile=0
+    chunks: int = 0  # chunked encoding: this many encoders at once on scene-cut chunks (0 or 1: one encoder)
+    chunk_threads: int = 4  # threads of each chunk encoder
     # Grain / detail retention (psy-rd). The defaults are stock VVenC and send nothing.
     tune_grain: bool = False  # Tune=grain: VVenC's preset for grainy film (sets psy-rd, CU tree, MCTF and QPA itself)
     psy_rd: float = 0.0  # PsyRD multiplier 0-3.98: 0 off, 1.0 what Tune=grain sets

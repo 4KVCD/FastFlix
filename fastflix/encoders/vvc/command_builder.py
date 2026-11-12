@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
+import logging
+import os
 import secrets
 import shlex
+import shutil
+import sys
+from functools import cache
+from pathlib import Path
 
 from fastflix.encoders.common.hdr_metadata import (
     chromaloc_mapping,
@@ -14,8 +20,11 @@ from fastflix.encoders.common.hdr_metadata import (
     valid_color_transfers,
 )
 from fastflix.encoders.common.helpers import Command, generate_all, null
+from fastflix.encoders.vvc.chunked import encode_plan
 from fastflix.models.encode import VVCSettings
 from fastflix.models.fastflix import FastFlix
+
+logger = logging.getLogger("fastflix")
 
 
 def is_constant_qp(fastflix: FastFlix) -> bool:
@@ -95,6 +104,103 @@ def generated_vvenc_params(settings: VVCSettings, constant_qp: bool) -> list[str
     return params + psy_params(settings, constant_qp)
 
 
+@cache
+def find_mkvmerge() -> str | None:
+    """MKVToolNix's mkvmerge, which joins the chunks (FFmpeg 9 loses VVC timestamps when it stream-copies Matroska)."""
+    found = shutil.which("mkvmerge")
+    if found:
+        return found
+    default = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "MKVToolNix" / "mkvmerge.exe"
+    return str(default) if default.exists() else None
+
+
+def chunking_blockers(fastflix: FastFlix, constant_qp: bool) -> list[str]:
+    """Why chunked encoding cannot run. It needs constant QP (VVenC has no rate control across chunks), an MKV output
+    joined by mkvmerge, a Python to run the chunk driver (not a frozen build) and a plain timeline: no reverse, no
+    concatenated source, no burned-in subtitles, no frame rate change, input-side seeking."""
+    video = fastflix.current_video
+    vs = video.video_settings
+    checks = {
+        "constant QP only": constant_qp,
+        "MKV output only": bool(vs.output_path) and vs.output_path.suffix.lower() == ".mkv",
+        "MKVToolNix's mkvmerge not found": find_mkvmerge() is not None,
+        "not in the packaged FastFlix": not getattr(sys, "frozen", False),
+        "needs fast seek": vs.fast_seek,
+        "not with reverse": not vs.reverse_video,
+        "not with a frame rate change": not vs.source_fps and not vs.output_fps,
+        "not with concatenation": not video.concat,
+        "not with burned-in subtitles": not any(track.burn_in and track.enabled for track in video.subtitle_tracks),
+    }
+    return [reason for reason, ok in checks.items() if not ok]
+
+
+def chunking_active(fastflix: FastFlix, settings: VVCSettings, constant_qp: bool) -> bool:
+    if settings.chunks <= 1:
+        return False
+    blockers = chunking_blockers(fastflix, constant_qp)
+    if blockers:
+        logger.warning(f"Chunked encoding is off, one encoder is used: {', '.join(blockers)}")
+    return not blockers
+
+
+# Output options of the whole file: the chunks leave them out, the audio and subtitle side file of the join keeps them
+GLOBAL_OPTIONS = ("-metadata", "-max_muxing_queue_size")
+
+
+def option_pairs(args: list[str], names) -> list[str]:
+    """The options among names with their values, in order."""
+    pairs = []
+    for index, arg in enumerate(args[:-1]):
+        if arg in names:
+            pairs += [arg, args[index + 1]]
+    return pairs
+
+
+def without_pairs(args: list[str], names) -> list[str]:
+    """args without the options among names and their values."""
+    kept, index = [], 0
+    while index < len(args):
+        if args[index] in names:
+            index += 2
+        else:
+            kept.append(args[index])
+            index += 1
+    return kept
+
+
+def chunked_command(fastflix: FastFlix, beginning: list[str], encode_args: list[str], ending: list[str]) -> Command:
+    """One command running chunked.py, which splits, encodes the chunks at once, joins and muxes. The single-encode
+    command is taken apart: the inputs (with the user's trim, used for audio and subtitles in the join), the video
+    mapping and filters, and the encoder options."""
+    settings: VVCSettings = fastflix.current_video.video_settings.video_encoder_settings
+    vs = fastflix.current_video.video_settings
+    source_end = beginning.index("-i") + 2
+    inputs_end = source_end
+    while inputs_end < len(beginning) and beginning[inputs_end] in ("-ss", "-to", "-i"):
+        inputs_end += 2  # external subtitle files and their trim
+    video_end = beginning.index("-c:v")
+    video_args = beginning[inputs_end:video_end]
+    plan = {
+        "ffmpeg": beginning[0],
+        "ffprobe": str(fastflix.config.ffprobe),
+        "source": str(fastflix.current_video.source),
+        "start": vs.start_time or None,
+        "end": vs.end_time or None,
+        "duration": fastflix.current_video.duration,
+        "chunks": settings.chunks,
+        "threads": settings.chunk_threads,
+        "video_args": without_pairs(video_args, GLOBAL_OPTIONS),
+        "encode_args": beginning[video_end:] + encode_args,
+        "final_inputs": [arg for arg in beginning[1:inputs_end] if arg != "-y"],
+        "final_args": option_pairs(video_args, GLOBAL_OPTIONS) + ending,
+        "mkvmerge": find_mkvmerge(),
+        "output": str(vs.output_path),
+        "work_dir": str(fastflix.current_video.work_path / f"chunks_{secrets.token_hex(4)}"),
+    }
+    driver = Path(__file__).with_name("chunked.py")
+    return Command(command=[sys.executable, str(driver), encode_plan(plan)], name="Chunked encode", exe="python")
+
+
 def build(fastflix: FastFlix):
     settings: VVCSettings = fastflix.current_video.video_settings.video_encoder_settings
 
@@ -109,12 +215,13 @@ def build(fastflix: FastFlix):
         beginning.extend(["-level", settings.levelidc])
 
     constant_qp = is_constant_qp(fastflix)
+    chunked = chunking_active(fastflix, settings, constant_qp)
     if not settings.subjopt or flat_inter_qp_needs_qpa_off(settings, constant_qp):
         beginning.extend(["-qpa", "0"])
 
     beginning.extend(["-period", str(settings.period)])
 
-    if settings.threads > 0:
+    if settings.threads > 0 and not chunked:  # every chunk encoder gets the chunk threads instead
         beginning.extend(["-threads", str(settings.threads)])
 
     vvc_params = generated_vvenc_params(settings, constant_qp=constant_qp)
@@ -190,14 +297,12 @@ def build(fastflix: FastFlix):
 
     elif settings.qp is not None:
         # FFmpeg's -qp takes whole numbers only; a fractional QP is passed as QP= in -vvenc-params, which wins
-        command = (
-            beginning
-            + vvenc_params
-            + ["-qp:v", str(int(float(settings.qp))), "-b:v", "0", "-preset:v", settings.preset]
-            + extra
-            + ending
+        encode_args = (
+            vvenc_params + ["-qp:v", str(int(float(settings.qp))), "-b:v", "0", "-preset:v", settings.preset] + extra
         )
-        return [Command(command=command, name="Single pass CRF", exe="ffmpeg")]
+        if chunked:
+            return [chunked_command(fastflix, beginning, encode_args, ending)]
+        return [Command(command=beginning + encode_args + ending, name="Single pass CRF", exe="ffmpeg")]
 
     else:
         return []

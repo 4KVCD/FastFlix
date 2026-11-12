@@ -143,6 +143,25 @@ value_combos = [
         "Each extra GOP keeps 33 more pictures in memory. Auto: VVenC's choice, 2 without IFP, 0 with IFP.\n"
         "Constant QP only (VVenC refuses it with a bitrate or maxrate).",
     ),
+    (
+        "chunks",
+        "Chunks",
+        [("Off", 0), ("2", 2), ("3", 3), ("4", 4), ("6", 6), ("8", 8), ("12", 12)],
+        "Chunked encoding: the video is split at the scene cuts nearest to even split points, the chunks are\n"
+        "encoded at the same time by this many encoders, then joined into one file with the audio and subtitles.\n"
+        "VVenC uses a few threads per encoder more efficiently than many.\n"
+        "Each encoder needs its own RAM; measured at 4K: about 11 GB each at preset slower with\n"
+        "Parallel GOPs 1 (4 chunks fill a 64 GB PC), 3.6 GB each at faster with Parallel GOPs 4.\n"
+        "Constant QP and MKV output only, and MKVToolNix (mkvmerge) must be installed; not with burned-in\n"
+        "subtitles, reverse, a frame rate change, a concatenated source or in the packaged FastFlix\n"
+        "(then one encoder is used and the log says why).",
+    ),
+    (
+        "chunk_threads",
+        "Threads per chunk",
+        [("1", 1), ("2", 2), ("3", 3), ("4", 4), ("6", 6), ("8", 8)],
+        "Threads of each chunk encoder (chunks x threads = the CPU threads used).",
+    ),
 ]
 
 
@@ -225,7 +244,7 @@ class VVC(SettingPanel):
         )
         speed_and_advanced = column(
             section_title("Speed"),
-            *(combos[name] for name in ("threads", "num_parallel_gops", "ifp")),
+            *(combos[name] for name in ("threads", "num_parallel_gops", "ifp", "chunks", "chunk_threads")),
             self.init_same_output_any_threads(),
             section_title("Advanced"),
             self.init_subjopt(),
@@ -590,6 +609,11 @@ class VVC(SettingPanel):
         self.widgets.mctf_level_tilt.setEnabled(not tune)
         self.widgets.subjopt.setEnabled(not tune)
         self.widgets.num_parallel_gops.setEnabled(not rate_control)
+        # Chunks need constant QP; while chunking, every encoder runs the chunk threads
+        chunked = not rate_control and self.widgets.chunks.currentData() > 1
+        self.widgets.chunks.setEnabled(not rate_control)
+        self.widgets.chunk_threads.setEnabled(chunked)
+        self.widgets.threads.setEnabled(not chunked)
         # Film grain analysis runs inside MCTF, which the tune turns off: VVenC refuses fga with it
         self.widgets.fga.setEnabled(not tune)
         self.widgets.fga_strength.setEnabled(not tune and self.widgets.fga.currentData() != 0)
