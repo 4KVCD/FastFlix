@@ -351,7 +351,11 @@ def test_vvc_grain_strength_and_speed_options():
         _build_with_settings(fga=3, fga_strength=50, num_parallel_gops=4, same_output_any_threads=True)[0].command
     )
     assert {"fga=3", "fgastrength=0.5", "NumParallelGOPs=4", "mtprofile=0"} <= set(params)
-    assert not any(param.startswith("fga") for param in _param_list(_build_with_settings(fga=0)[0].command))
+    assert not any(param.lower().startswith("fgainterval") for param in params)  # automatic: VVenC's default
+    params = _param_list(_build_with_settings(fga=2, fga_interval=3)[0].command)
+    assert "FgaIntervalLog2=3" in params
+    params = _param_list(_build_with_settings(fga=0, fga_interval=3)[0].command)
+    assert not any(param.lower().startswith("fga") for param in params)
 
 
 def test_vvc_ffmpeg_used_for_vvc_encodes():

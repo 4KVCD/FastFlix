@@ -167,6 +167,7 @@ class VVCSettings(EncoderSettings):
     mctf_level_tilt: int = 100  # MCTF strength raise for the pictures others predict from: 0 off, 100 tuned, max 300
     fga: int = 2  # film grain analysis: 0 off, 1-3 (3 is not decodable by FFmpeg's VVC decoder)
     fga_strength: int = 100  # percent of the analysed grain, 1-399
+    fga_interval: int = -1  # FgaIntervalLog2: also analyse every 2**n-th picture of a GOP; -1 = each GOP's first only
     num_parallel_gops: int = 4  # GOPs encoded at once at constant QP (faster, more RAM); -1 = VVenC's own choice
     same_output_any_threads: bool = False  # mtprofile=0
     chunks: int = 0  # chunked encoding: this many encoders at once on scene-cut chunks (0 or 1: one encoder)

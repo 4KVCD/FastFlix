@@ -124,6 +124,23 @@ value_combos = [
         "3 is the better grain model, but FFmpeg-based players (mpv, VLC) cannot decode it: use 2 for them.",
     ),
     (
+        "fga_interval",
+        "Grain analysed",
+        [
+            ("Once per GOP", -1),
+            ("Every 16 pictures", 4),
+            ("Every 8 pictures", 3),
+            ("Every 4 pictures", 2),
+            ("Every 2 pictures", 1),
+            ("Every picture", 0),
+        ],
+        "FgaIntervalLog2: how often film grain analysis measures the grain (a GOP is 32 pictures).\n"
+        "Once per GOP is VVenC's default. More often follows grain changes within a GOP more closely;\n"
+        "each extra analysed picture costs a filtered copy, the analysis and, where MCTF does not filter\n"
+        "that picture, a motion search, and holds its buffers until its GOP is coded (slower, more RAM).\n"
+        "VVenC refuses it with a GOPSize it does not divide or with one-pass look-ahead in your own options.",
+    ),
+    (
         "threads",
         "Threads",
         [("Auto", 0), ("1", 1), ("2", 2), ("4", 4), ("6", 6), ("8", 8), ("12", 12), ("16", 16), ("24", 24), ("32", 32)],
@@ -241,6 +258,7 @@ class VVC(SettingPanel):
             self.init_flat_inter_qp(),
             combos["fga"],
             self.init_fga_strength(),
+            combos["fga_interval"],
         )
         speed_and_advanced = column(
             section_title("Speed"),
@@ -616,7 +634,9 @@ class VVC(SettingPanel):
         self.widgets.threads.setEnabled(not chunked)
         # Film grain analysis runs inside MCTF, which the tune turns off: VVenC refuses fga with it
         self.widgets.fga.setEnabled(not tune)
-        self.widgets.fga_strength.setEnabled(not tune and self.widgets.fga.currentData() != 0)
+        grain_analysis = not tune and self.widgets.fga.currentData() != 0
+        self.widgets.fga_strength.setEnabled(grain_analysis)
+        self.widgets.fga_interval.setEnabled(grain_analysis)
 
     def setting_change(self, update=True, pix_change=False):
         if self.updating_settings or not self.main.input_video:

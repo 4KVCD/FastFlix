@@ -95,6 +95,8 @@ def generated_vvenc_params(settings: VVCSettings, constant_qp: bool) -> list[str
         params.append(f"fga={settings.fga}")
         if settings.fga_strength != 100:
             params.append(f"fgastrength={settings.fga_strength / 100:g}")
+        if settings.fga_interval >= 0:
+            params.append(f"FgaIntervalLog2={settings.fga_interval}")
     if settings.ifp != "auto":
         params.append(f"IFP={1 if settings.ifp == 'on' else 0}")
     if constant_qp and settings.num_parallel_gops != -1:
