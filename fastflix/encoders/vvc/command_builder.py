@@ -197,7 +197,8 @@ def chunked_command(fastflix: FastFlix, beginning: list[str], encode_args: list[
         "final_args": option_pairs(video_args, GLOBAL_OPTIONS) + ending,
         "mkvmerge": find_mkvmerge(),
         "output": str(vs.output_path),
-        "work_dir": str(fastflix.current_video.work_path / f"chunks_{secrets.token_hex(4)}"),
+        # chunked.py names the work folder after the job, so running the same job again resumes it
+        "resume_root": str(fastflix.config.work_path / "chunked"),
     }
     driver = Path(__file__).with_name("chunked.py")
     return Command(command=[sys.executable, str(driver), encode_plan(plan)], name="Chunked encode", exe="python")

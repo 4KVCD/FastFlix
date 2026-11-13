@@ -89,6 +89,29 @@ def test_progress_time_counts_every_chunks_frames():
     assert "time=00:00:10.00 " in line
 
 
+def test_salvage_keeps_the_frames_coded_before_the_last_usable_keyframe():
+    d = 1 / 24
+    # decode order of a random-access stream (frame numbers): keyframe 0, frames 4, 2, 1, 3, then keyframe 8 whose
+    # leading pictures 5-7 are coded after it, then 6 and 5 written before the encoder was killed
+    order = [(0, True), (4, False), (2, False), (1, False), (3, False), (8, True), (6, False), (5, False)]
+    packets = [(frame * d, key) for frame, key in order]
+    assert chunked.salvage_cut(packets, d) == 5  # frames 0-4; the part encoded next starts at frame 5
+    # frame 3 missing before the keyframe: nothing whole to keep
+    assert chunked.salvage_cut([p for p in packets if p[0] != 3 * d], d) == 0
+    assert chunked.salvage_cut(packets[:5], d) == 0  # no second keyframe yet
+
+
+def test_work_folder_is_the_same_for_the_same_job():
+    plan = {
+        "resume_root": "r", "ffmpeg": "missing-ffmpeg", "source": "in.mkv", "start": None, "end": None, "chunks": 4,
+        "video_args": ["-map", "0:0"], "encode_args": ["-c:v", "libvvenc", "-qp", "28"], "threads": 6, "output": "a.mkv",
+    }  # fmt: skip
+    folder = chunked.work_folder(plan)
+    assert chunked.work_folder({**plan, "threads": 4, "output": "b.mkv"}) == folder
+    assert chunked.work_folder({**plan, "encode_args": ["-c:v", "libvvenc", "-qp", "30"]}) != folder
+    assert chunked.work_folder({"work_dir": "old"}) == Path("old")  # queued before resume existed
+
+
 def test_join_check_finds_a_lost_and_a_doubled_frame():
     assert chunked.join_problems([0.0, 0.04, 0.08], 0.04) == []
     assert len(chunked.join_problems([0.0, 0.04, 0.12, 0.125], 0.04)) == 2
