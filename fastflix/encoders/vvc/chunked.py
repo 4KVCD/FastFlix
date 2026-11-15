@@ -264,7 +264,7 @@ def match_priority(encoders):
 
 
 def encode_parts(plan, jobs, chunk_count, start_offset, frame_duration, done_frames, done_size, work_dir):
-    """Encodes the next part of every unfinished chunk at once; jobs: (chunk, part path, trim start, trim end).
+    """Encodes the next part of each given chunk at once; jobs: (chunk, part path, trim start, trim end).
     Each finished part gets its marker. False when an encoder failed."""
     encoders = []
     for chunk, output, trim_start, trim_end in jobs:
@@ -608,11 +608,17 @@ def run_locked(plan, work_dir):
     done_frames = sum(frames for parts in done for _, frames in parts)
     if done_frames:
         log(f"Chunked encode: resuming with {done_frames} frames kept from the earlier run")
-    if jobs:
+    # A PC without the RAM for every chunk's encoder at once runs them in batches (each 4K encoder holds about 10 GB).
+    # The chunks' commands stay the same, so the output does too. The chunks are about equally long, so a batch's
+    # encoders finish close together and a rolling start would gain little.
+    batch_size = plan.get("max_parallel") or max(len(jobs), 1)
+    for first in range(0, len(jobs), batch_size):
+        batch = jobs[first : first + batch_size]
+        done_frames = sum(frames for parts in done for _, frames in parts)
         done_size = sum(part.stat().st_size for parts in done for part, _ in parts)
-        if not encode_parts(plan, jobs, len(ranges), start_offset, frame_duration, done_frames, done_size, work_dir):
+        if not encode_parts(plan, batch, len(ranges), start_offset, frame_duration, done_frames, done_size, work_dir):
             return 1
-        for chunk, output, _, _ in jobs:
+        for chunk, output, _, _ in batch:
             done[chunk].append((output, read_json(marker_path(output))["frames"]))
 
     outputs = [part for parts in done for part, _ in parts]
