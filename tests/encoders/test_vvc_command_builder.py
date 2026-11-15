@@ -301,12 +301,13 @@ def test_vvc_default_qp_turns_on_every_new_vvenc_option():
         "CuTreeLookAheadGOPs=4",
         "AdaptiveIntra=1",
         "DecodingRefreshType=cra",
-        "MCTFLevelTilt=100",
+        "MCTFLevelTilt=1",
         "fga=2",
         "NumParallelGOPs=4",
     ]
+    # VVenC's tilt is on by default, so off must be sent
     tilt_off = _param_list(_build_with_settings(mctf_level_tilt=0)[0].command)
-    assert not any(param.startswith("MCTFLevelTilt") for param in tilt_off)
+    assert "MCTFLevelTilt=0" in tilt_off
 
 
 def test_vvc_fractional_qp():
@@ -387,7 +388,7 @@ def test_vvc_grain_tune_comes_first_and_owns_its_keys():
     # capped QP (a maxrate in QP mode) refuses the tune's CU-tree picture QPs: the greyed-out tune is not sent and
     # FastFlix's own keys stay; the sliders still apply
     capped = _param_list(_build_with_settings(maxrate=8000, tune_grain=True, psy_rd=1.0)[0].command)
-    assert "Tune=grain" not in capped and "BIM=1" in capped and "MCTFLevelTilt=100" in capped and "fga=2" in capped
+    assert "Tune=grain" not in capped and "BIM=1" in capped and "MCTFLevelTilt=1" in capped and "fga=2" in capped
     assert capped[-1] == "PsyRD=1"
 
 

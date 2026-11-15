@@ -164,7 +164,7 @@ class VVCSettings(EncoderSettings):
     cutree_lookahead_gops: int = 4  # 1-4 GOPs; each extra GOP holds one more GOP of pictures in RAM
     adaptive_intra: bool = True  # I pictures at scene cuts
     refresh_type: Literal["cra", "idr"] = "cra"  # open or closed GOP
-    mctf_level_tilt: int = 100  # MCTF strength raise for the pictures others predict from: 0 off, 100 tuned, max 300
+    mctf_level_tilt: int = 100  # MCTF strength raise for the pictures others predict from: 0 off, any other value on
     fga: int = 2  # film grain analysis: 0 off, 1-3 (3 is not decodable by FFmpeg's VVC decoder)
     fga_strength: int = 100  # percent of the analysed grain, 1-399
     fga_interval: int = -1  # FgaIntervalLog2: also analyse every 2**n-th picture of a GOP; -1 = each GOP's first only

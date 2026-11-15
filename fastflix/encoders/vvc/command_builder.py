@@ -88,8 +88,10 @@ def generated_vvenc_params(settings: VVCSettings, constant_qp: bool) -> list[str
     if settings.adaptive_intra:
         params.append("AdaptiveIntra=1")
     params.append(f"DecodingRefreshType={settings.refresh_type}")
-    if settings.mctf_level_tilt and not tune:
-        params.append(f"MCTFLevelTilt={settings.mctf_level_tilt}")
+    # VVenC's MCTFLevelTilt is on (1) or off (0) and on by default, so off is sent too. FastFlix stores on as 100, the
+    # strength of the old 0-300 form, so saved profiles and queued jobs keep their value.
+    if not tune:
+        params.append(f"MCTFLevelTilt={1 if settings.mctf_level_tilt else 0}")
     # Film grain analysis runs inside MCTF, which the tune turns off: VVenC refuses fga with the tune
     if settings.fga and not tune:
         params.append(f"fga={settings.fga}")
