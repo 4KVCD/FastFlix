@@ -37,6 +37,8 @@ SCENE_THRESHOLD = 10  # scdet's score (0-100) above which a frame starts a new s
 MAX_WINDOW_SECONDS = 30  # how far from the even split point a scene cut may be taken
 SEEK_MARGIN_SECONDS = 10  # the coarse input seek lands this much before the chunk; trim cuts exactly
 PROGRESS_INTERVAL_SECONDS = 2
+# The last chunk still encoding is stopped and its rest split again when it has more than this left (once per job)
+RESPLIT_MIN_SECONDS = 15 * 60
 MKVMERGE_WARNING = 1  # mkvmerge's exit code when it finished with warnings
 CLUSTER_TIME_LIMIT_MS = 1000  # small Matroska clusters: a killed encoder's file loses at most the last second written
 TIME_TOLERANCE = 0.002  # Matroska stores times in whole milliseconds
@@ -93,19 +95,24 @@ def stream_start_time(ffprobe, source):
 
 def frame_times(ffprobe, source, start, length):
     """Sorted PTS (seconds) of the video frames from the absolute time start for length seconds, read from the
-    packets (no decode). ffprobe starts at the keyframe before start, so the list can begin a little earlier."""
+    packets (no decode). ffprobe starts at the keyframe before start, so the list can begin a little earlier. It also
+    counts the length from that keyframe, so a short interval could end before start + length: it reads
+    SEEK_MARGIN_SECONDS more and drops what lies past the end."""
+    read = f"{max(start, 0):.6f}%+{length + SEEK_MARGIN_SECONDS:.6f}"
     result = run_quiet(
         [
-            ffprobe, "-v", "error", "-select_streams", "v:0", "-read_intervals", f"{max(start, 0):.6f}%+{length:.6f}",
+            ffprobe, "-v", "error", "-select_streams", "v:0", "-read_intervals", read,
             "-show_entries", "packet=pts_time", "-of", "csv=p=0", source,
         ]
     )  # fmt: skip
     times = []
     for line in result.stdout.splitlines():
         try:
-            times.append(float(line.strip().rstrip(",")))
+            time_s = float(line.strip().rstrip(","))
         except ValueError:
-            pass
+            continue
+        if time_s <= start + length:
+            times.append(time_s)
     return sorted(set(times))
 
 
@@ -263,9 +270,37 @@ def match_priority(encoders):
             pass
 
 
-def encode_parts(plan, jobs, chunk_count, start_offset, frame_duration, done_frames, done_size, work_dir):
-    """Encodes the next part of each given chunk at once; jobs: (chunk, part path, trim start, trim end).
-    Each finished part gets its marker. False when an encoder failed."""
+def part_seconds(job, range_times):
+    """Length of a job's part (chunk, part path, trim start, trim end); a None trim is the range's own first or last
+    time, range_times = (first, last)."""
+    _, _, trim_start, trim_end = job
+    first, last = range_times
+    return (last if trim_end is None else trim_end) - (first if trim_start is None else trim_start)
+
+
+def seconds_left(frames, expected_frames, elapsed):
+    """The encoder's time left at its average speed so far; None while it has no frames yet (look-ahead filling)."""
+    if frames <= 0 or elapsed <= 0:
+        return None
+    return max(expected_frames - frames, 0) / (frames / elapsed)
+
+
+def write_marker(encoder, job):
+    """The finished part's marker; its frame count is the encoder's last progress block."""
+    _, output, trim_start, _ = job
+    encoder.reader.join(timeout=5)
+    frames = int(encoder.number("frame"))
+    write_json(marker_path(output), {"frames": frames, "complete": True, "trim_start": trim_start})
+
+
+def encode_parts(plan, jobs, chunk_count, start_offset, frame_duration, done_frames, done_size, work_dir, tail_range):
+    """Encodes the next part of each given chunk at once; jobs: (chunk, part path, trim start, trim end). Each
+    finished part gets its marker. Returns ("done", None), ("failed", None) or ("resplit", chunk).
+
+    tail_range (the range's first and last time, None: no re-split) lets the last encoder still running be judged
+    once, when another of these encoders has finished: with more than RESPLIT_MIN_SECONDS left at its average speed,
+    it is stopped and its rest is to be split over plan["chunks"] chunks, so the end of the job does not wait for
+    one encoder on a few threads while the rest of the CPU idles."""
     encoders = []
     for chunk, output, trim_start, trim_end in jobs:
         command = chunk_command(plan, trim_start, trim_end, start_offset, output)
@@ -274,6 +309,7 @@ def encode_parts(plan, jobs, chunk_count, start_offset, frame_duration, done_fra
     record_encoders(work_dir, encoders)
 
     started = time.monotonic()
+    tail_judged = tail_range is None or len(encoders) < 2
     while any(e.process.poll() is None for e in encoders):
         failed = [e for e in encoders if e.process.poll() not in (None, 0)]
         if failed:
@@ -283,7 +319,25 @@ def encode_parts(plan, jobs, chunk_count, start_offset, frame_duration, done_fra
             log("Chunked encode: a chunk encoder failed:")
             for line in failed[0].last_errors():
                 log(line)
-            return False
+            return "failed", None
+        running = [i for i, e in enumerate(encoders) if e.process.poll() is None]
+        if not tail_judged and len(running) == 1:
+            last, job = encoders[running[0]], jobs[running[0]]
+            expected = part_seconds(job, tail_range) / frame_duration
+            left = seconds_left(last.number("frame"), expected, time.monotonic() - started)
+            if left is not None:
+                tail_judged = True
+                log(f"Chunked encode: chunk {job[0] + 1} is the last one running, about {left / 60:.0f} min left")
+                if left > RESPLIT_MIN_SECONDS:
+                    log(
+                        f"Chunked encode: chunk {job[0] + 1} is stopped, its rest is split over {plan['chunks']} chunks"
+                    )
+                    last.process.kill()
+                    last.process.wait()
+                    for encoder, finished in zip(encoders, jobs):
+                        if encoder is not last:
+                            write_marker(encoder, finished)
+                    return "resplit", job[0]
         match_priority(encoders)
         log(progress_line(encoders, started, frame_duration, done_frames, done_size))
         time.sleep(PROGRESS_INTERVAL_SECONDS)
@@ -292,13 +346,11 @@ def encode_parts(plan, jobs, chunk_count, start_offset, frame_duration, done_fra
         log("Chunked encode: a chunk encoder failed:")
         for line in bad.last_errors():
             log(line)
-        return False
-    for encoder, (_, output, trim_start, _) in zip(encoders, jobs):
-        encoder.reader.join(timeout=5)  # the last progress block holds the part's frame count
-        frames = int(encoder.number("frame"))
-        write_json(marker_path(output), {"frames": frames, "complete": True, "trim_start": trim_start})
+        return "failed", None
+    for encoder, job in zip(encoders, jobs):
+        write_marker(encoder, job)
     log(progress_line(encoders, started, frame_duration, done_frames, done_size))
-    return True
+    return "done", None
 
 
 # ---- Resuming ----
@@ -446,9 +498,10 @@ def first_frame_at(plan, time_from, start_offset):
     return next((t for t in times if t >= time_from), time_from)
 
 
-def resume_chunk(plan, work_dir, chunk, chunk_start, start_offset, frame_duration):
+def resume_chunk(plan, work_dir, chunk, chunk_start, chunk_end, start_offset, frame_duration):
     """The chunk's parts so far, each (path, frames), salvaging one a killed encoder left, and where its next part
-    starts: None when the chunk is finished, else (part path, trim start)."""
+    starts: None when the chunk is finished, else (part path, trim start). A chunk whose rest was split off ends
+    where its kept frames end, so its next part would start at its end: it is finished."""
     parts = []
     number = 0
     trim_start = chunk_start
@@ -470,6 +523,8 @@ def resume_chunk(plan, work_dir, chunk, chunk_start, start_offset, frame_duratio
         trim_start = snap_split(frame_times(plan["ffprobe"], plan["source"], target - 2, 4), target)
         if trim_start is None:
             raise ResumeError(f"no source frames found after {last_kept:.3f} s to continue chunk {chunk + 1}")
+    if None not in (trim_start, chunk_end) and trim_start >= chunk_end - frame_duration / 2:
+        return parts, None
     return parts, (part_path(work_dir, chunk, number), trim_start)
 
 
@@ -569,18 +624,91 @@ def run(plan):
         (work_dir / "lock.json").unlink(missing_ok=True)
 
 
-def chunk_edges(plan, work_dir, start, end, start_offset):
-    """The chunk edges (absolute PTS; None = the file's own first or last frame), found once and kept for resuming."""
+def chunk_state(plan, work_dir, range_times, start_offset):
+    """The chunks' ranges, [start, end] in absolute PTS (None = the file's own first or last frame), and whether the
+    last chunk's rest was split again: found once and kept in state.json for resuming. A state from before the
+    re-split holds the edges only."""
     state_file = work_dir / "state.json"
-    state = read_json(state_file)
-    if state and state.get("edges"):
+    state = read_json(state_file) or {}
+    if state.get("ranges"):
         log("Chunked encode: resuming, the chunks' split points are those of the earlier run")
-        return state["edges"]
-    first_trim = start + start_offset if plan["start"] else None
-    last_trim = end + start_offset if plan["end"] else None
-    edges = [first_trim] + find_splits(plan, start + start_offset, end + start_offset, start_offset) + [last_trim]
-    write_json(state_file, {"edges": edges})
-    return edges
+        return state
+    if state.get("edges"):
+        log("Chunked encode: resuming, the chunks' split points are those of the earlier run")
+        edges = state["edges"]
+    else:
+        first, last = range_times
+        splits = find_splits(plan, first, last, start_offset)
+        edges = [first if plan["start"] else None] + splits + [last if plan["end"] else None]
+    state = {"ranges": [list(pair) for pair in zip(edges, edges[1:])], "resplit": False}
+    write_json(state_file, state)
+    return state
+
+
+def join_order(ranges):
+    """The chunks in the order of the video: a re-split chunk's new pieces come after the others in the list."""
+    return sorted(range(len(ranges)), key=lambda chunk: float("-inf") if ranges[chunk][0] is None else ranges[chunk][0])
+
+
+def resplit(plan, work_dir, state, chunk, range_times, start_offset, frame_duration):
+    """Splits the rest of a stopped chunk over plan["chunks"] new chunks at the scene cuts, as at the start: the
+    chunk keeps the frames salvaged before its encoder's last keyframe and ends there. Written to state.json at once,
+    with "resplit" set, so a resume runs the new chunks and never splits again."""
+    ranges = state["ranges"]
+    chunk_start, chunk_end = ranges[chunk]
+    parts, next_part = resume_chunk(plan, work_dir, chunk, chunk_start, chunk_end, start_offset, frame_duration)
+    state = {"ranges": [list(pair) for pair in ranges], "resplit": True}
+    if next_part:
+        rest_start = next_part[1]
+        first = range_times[0] if rest_start is None else rest_start
+        last = range_times[1] if chunk_end is None else chunk_end
+        edges = [rest_start] + find_splits(plan, first, last, start_offset) + [chunk_end]
+        pieces = [list(pair) for pair in zip(edges, edges[1:])]
+        log(f"Chunked encode: the rest of chunk {chunk + 1} is split into {len(pieces)} chunks")
+        if parts:
+            state["ranges"][chunk][1] = rest_start
+        else:  # nothing was kept: the chunk itself becomes the first piece
+            state["ranges"][chunk] = pieces.pop(0)
+        state["ranges"] += pieces
+    write_json(work_dir / "state.json", state)
+    return state
+
+
+def encode_chunks(plan, work_dir, state, range_times, start_offset, frame_duration, first_pass):
+    """Resumes every chunk and encodes what is left. Returns (each chunk's parts, None) when all are encoded,
+    (parts, chunk) when the last chunk still running was stopped for a re-split, (None, None) on a failure."""
+    ranges = state["ranges"]
+    done, jobs = [], []
+    for chunk, (chunk_start, chunk_end) in enumerate(ranges):
+        parts, next_part = resume_chunk(plan, work_dir, chunk, chunk_start, chunk_end, start_offset, frame_duration)
+        done.append(parts)
+        if next_part:
+            output, trim_start = next_part
+            marker_path(output).unlink(missing_ok=True)  # a stale marker must not mark the new part finished
+            jobs.append((chunk, output, trim_start, chunk_end))
+    done_frames = sum(frames for parts in done for _, frames in parts)
+    if done_frames and first_pass:
+        log(f"Chunked encode: resuming with {done_frames} frames kept from the earlier run")
+    # A PC without the RAM for every chunk's encoder at once runs them in batches (each 4K encoder holds about 10 GB).
+    # The chunks' commands stay the same, so the output does too.
+    batch_size = plan.get("max_parallel") or max(len(jobs), 1)
+    for first in range(0, len(jobs), batch_size):
+        batch = jobs[first : first + batch_size]
+        last_batch = first + batch_size >= len(jobs)
+        tail_range = range_times if last_batch and not state.get("resplit") else None
+        done_frames = sum(frames for parts in done for _, frames in parts)
+        done_size = sum(part.stat().st_size for parts in done for part, _ in parts)
+        status, stopped = encode_parts(
+            plan, batch, len(ranges), start_offset, frame_duration, done_frames, done_size, work_dir, tail_range
+        )
+        if status == "failed":
+            return None, None
+        for chunk, output, _, _ in batch:
+            if chunk != stopped:
+                done[chunk].append((output, read_json(marker_path(output))["frames"]))
+        if status == "resplit":
+            return done, stopped
+    return done, None
 
 
 def run_locked(plan, work_dir):
@@ -595,33 +723,19 @@ def run_locked(plan, work_dir):
     # The source's pace, for the progress time and the join check; averaged, as Matroska stores times in whole ms
     frame_duration = (head[-1] - head[0]) / (len(head) - 1)
 
-    edges = chunk_edges(plan, work_dir, start, end, start_offset)
-    ranges = list(zip(edges, edges[1:]))
-    done, jobs = [], []
-    for chunk, (chunk_start, chunk_end) in enumerate(ranges):
-        parts, next_part = resume_chunk(plan, work_dir, chunk, chunk_start, start_offset, frame_duration)
-        done.append(parts)
-        if next_part:
-            output, trim_start = next_part
-            marker_path(output).unlink(missing_ok=True)  # a stale marker must not mark the new part finished
-            jobs.append((chunk, output, trim_start, chunk_end))
-    done_frames = sum(frames for parts in done for _, frames in parts)
-    if done_frames:
-        log(f"Chunked encode: resuming with {done_frames} frames kept from the earlier run")
-    # A PC without the RAM for every chunk's encoder at once runs them in batches (each 4K encoder holds about 10 GB).
-    # The chunks' commands stay the same, so the output does too. The chunks are about equally long, so a batch's
-    # encoders finish close together and a rolling start would gain little.
-    batch_size = plan.get("max_parallel") or max(len(jobs), 1)
-    for first in range(0, len(jobs), batch_size):
-        batch = jobs[first : first + batch_size]
-        done_frames = sum(frames for parts in done for _, frames in parts)
-        done_size = sum(part.stat().st_size for parts in done for part, _ in parts)
-        if not encode_parts(plan, batch, len(ranges), start_offset, frame_duration, done_frames, done_size, work_dir):
+    range_times = (start + start_offset, end + start_offset)
+    state = chunk_state(plan, work_dir, range_times, start_offset)
+    first_pass = True
+    while True:
+        done, stopped = encode_chunks(plan, work_dir, state, range_times, start_offset, frame_duration, first_pass)
+        first_pass = False
+        if done is None:
             return 1
-        for chunk, output, _, _ in batch:
-            done[chunk].append((output, read_json(marker_path(output))["frames"]))
+        if stopped is None:
+            break
+        state = resplit(plan, work_dir, state, stopped, range_times, start_offset, frame_duration)
 
-    outputs = [part for parts in done for part, _ in parts]
+    outputs = [part for chunk in join_order(state["ranges"]) for part, _ in done[chunk]]
     if not join_and_mux(plan, outputs, work_dir):
         return 1
     if not check_output(plan, plan["output"], frame_duration, sum(frames for parts in done for _, frames in parts)):

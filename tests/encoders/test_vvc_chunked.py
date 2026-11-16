@@ -112,6 +112,97 @@ def test_work_folder_is_the_same_for_the_same_job():
     assert chunked.work_folder({"work_dir": "old"}) == Path("old")  # queued before resume existed
 
 
+def test_time_left_from_the_average_speed_and_open_edges():
+    assert chunked.seconds_left(100, 400, elapsed=50.0) == approx(150.0)  # 2 frames/s, 300 left
+    assert chunked.seconds_left(0, 400, elapsed=50.0) is None  # no frames yet: not judged
+    assert chunked.part_seconds((0, Path("p.mkv"), None, 30.0), (10.0, 100.0)) == 20.0
+    assert chunked.part_seconds((1, Path("q.mkv"), 30.0, None), (10.0, 100.0)) == 70.0
+
+
+def test_a_chunk_cut_where_its_kept_frames_end_is_finished(tmp_path):
+    part = chunked.part_path(tmp_path, 0, 0)
+    part.write_bytes(b"x")
+    chunked.write_json(
+        chunked.marker_path(part), {"frames": 25, "complete": False, "trim_start": 10.0, "last_pts": 1.0}
+    )
+    with (
+        mock.patch.object(chunked, "first_frame_at", return_value=10.0),
+        mock.patch.object(chunked, "frame_times", return_value=[10.96, 11.0, 11.04, 11.08]),
+    ):
+        # the next part would start halfway between the last kept frame (11.0) and the next (11.04)
+        plan = {"ffprobe": "ffprobe", "source": "in.mkv"}
+        assert chunked.resume_chunk(plan, tmp_path, 0, 10.0, 11.02, 0.0, 0.04) == ([(part, 25)], None)
+        parts, next_part = chunked.resume_chunk(plan, tmp_path, 0, 10.0, 20.0, 0.0, 0.04)
+    assert next_part == (chunked.part_path(tmp_path, 0, 1), approx(11.02))
+
+
+def test_an_earlier_runs_edges_are_read_as_ranges_and_joined_in_video_order(tmp_path):
+    chunked.write_json(tmp_path / "state.json", {"edges": [None, 10.0, 20.0, None]})
+    with mock.patch.object(chunked, "log"):
+        state = chunked.chunk_state({}, tmp_path, (0.0, 30.0), 0.0)
+    assert state == {"ranges": [[None, 10.0], [10.0, 20.0], [20.0, None]], "resplit": False}
+    # chunk 1 was cut at 12.5 and its rest split into chunks 3 and 4
+    assert chunked.join_order([[None, 10.0], [10.0, 12.5], [20.0, None], [12.5, 16.0], [16.0, 20.0]]) == [0, 1, 3, 4, 2]
+
+
+class _FakeEncoder:
+    """Exits after a set number of polls (None: runs until killed), with a set frame count."""
+
+    script = []  # per encoder started: (polls until exit or None, frames)
+
+    def __init__(self, command, error_file):
+        self.left, frames = _FakeEncoder.script.pop(0)
+        self.code = None
+        self.number = {"frame": frames, "total_size": 0}.get
+        self.reader = mock.Mock()
+        self.process = self  # stands in for its own process too
+
+    @property
+    def returncode(self):
+        return self.code
+
+    def wait(self):
+        pass
+
+    def nice(self, value=None):
+        pass
+
+    def poll(self):
+        if self.code is None and self.left is not None:
+            self.left -= 1
+            if self.left <= 0:
+                self.code = 0
+        return self.code
+
+    def kill(self):
+        self.code = -9
+
+
+def _encode_tail(tmp_path, script, tail_range):
+    _FakeEncoder.script = list(script)
+    jobs = [(0, chunked.part_path(tmp_path, 0, 0), None, 50.0), (1, chunked.part_path(tmp_path, 1, 0), 50.0, None)]
+    plan = {"ffmpeg": "ffmpeg", "source": "in.mkv", "video_args": [], "encode_args": [], "threads": 2, "chunks": 4}
+    with (
+        mock.patch.object(chunked, "ChunkEncoder", _FakeEncoder),
+        mock.patch.object(chunked, "record_encoders"),
+        mock.patch.object(chunked, "log"),
+        mock.patch.object(chunked.time, "sleep"),
+        mock.patch.object(chunked.time, "monotonic", side_effect=[0.0] + [60.0] * 50),
+    ):
+        return chunked.encode_parts(plan, jobs, 2, 0.0, 0.04, 0, 0, tmp_path, tail_range)
+
+
+def test_the_last_chunk_running_is_stopped_for_a_resplit_only_with_much_left(tmp_path):
+    # chunk 0 finishes; chunk 1 (50 s = 1250 frames) did 100 frames in 60 s: about 11.5 min left at that pace
+    with mock.patch.object(chunked, "RESPLIT_MIN_SECONDS", 600):
+        assert _encode_tail(tmp_path, [(2, 1250), (None, 100)], (0.0, 100.0)) == ("resplit", 1)
+    assert chunked.read_json(chunked.marker_path(chunked.part_path(tmp_path, 0, 0)))["complete"]  # chunk 0 kept
+    with mock.patch.object(chunked, "RESPLIT_MIN_SECONDS", 900):  # under 15 min: it finishes on its own
+        assert _encode_tail(tmp_path, [(2, 1250), (5, 100)], (0.0, 100.0)) == ("done", None)
+    with mock.patch.object(chunked, "RESPLIT_MIN_SECONDS", 600):  # already split once in this job: never again
+        assert _encode_tail(tmp_path, [(2, 1250), (5, 100)], None) == ("done", None)
+
+
 def test_join_check_finds_a_lost_and_a_doubled_frame():
     assert chunked.join_problems([0.0, 0.04, 0.08], 0.04) == []
     assert len(chunked.join_problems([0.0, 0.04, 0.12, 0.125], 0.04)) == 2
