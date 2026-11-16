@@ -282,21 +282,6 @@ def estimate(side):
     return side.estimate() if side else (0, 0)
 
 
-def match_priority(processes):
-    """The chunk encoders and the side file's FFmpeg follow the driver's priority, which FastFlix sets and may change
-    while it runs."""
-    try:
-        own = psutil.Process().nice()
-    except psutil.Error:
-        return
-    for process in processes:
-        try:
-            if process.nice() != own:
-                process.nice(own)
-        except psutil.Error:
-            pass
-
-
 def part_seconds(job, range_times):
     """Length of a job's part (chunk, part path, trim start, trim end); a None trim is the range's own first or last
     time, range_times = (first, last)."""
@@ -371,7 +356,6 @@ def encode_parts(
                         if encoder is not last:
                             write_marker(encoder, finished)
                     return "resplit", job[0]
-        match_priority([e.process for e in encoders] + (side.running() if side else []))
         log(progress_line(encoders, started, frame_duration, done_frames, done_size, estimate(side)))
         time.sleep(PROGRESS_INTERVAL_SECONDS)
     if any(e.process.returncode != 0 for e in encoders):

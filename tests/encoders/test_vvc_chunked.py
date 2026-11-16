@@ -239,9 +239,6 @@ class _FakeEncoder:
     def wait(self):
         pass
 
-    def nice(self, value=None):
-        pass
-
     def poll(self):
         if self.code is None and self.left is not None:
             self.left -= 1
