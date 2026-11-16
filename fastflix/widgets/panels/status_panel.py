@@ -126,7 +126,7 @@ class StatusPanel(QtWidgets.QWidget):
         try:
             bitrate, _ = bitrate.split("k", 1)
             bitrate = float(bitrate)
-            # kbit/s x seconds -> bytes -> MiB, the unit Windows shows file sizes in
+            # kbit/s x seconds -> bytes -> binary MB (2**20 bytes), as Windows shows file sizes
             size_eta = self.get_movie_length() * bitrate * 1000 / 8 / 2**20
         except AttributeError:
             self.size_label.setText(f"{t('Size Estimate')}: N/A")
@@ -137,7 +137,7 @@ class StatusPanel(QtWidgets.QWidget):
             if not size_eta:
                 self.size_label.setText(f"{t('Size Estimate')}: N/A")
             else:
-                self.size_label.setText(f"{t('Size Estimate')}: {size_eta:.2f} MiB")
+                self.size_label.setText(f"{t('Size Estimate')}: {size_eta:.2f} MB")
 
     def update_nvencc(self, raw_line):
         """
