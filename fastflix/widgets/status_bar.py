@@ -143,7 +143,9 @@ class StatusBarWidget(QtWidgets.QFrame):
         elif state == STATE_IDLE:
             self.status_label.setText(t("Ready"))
 
-        if state == STATE_IDLE:
+        if state == STATE_ENCODING:
+            self._show_progress()  # from the encode's start: an encode under 1 % done shows 0 %, not no bar
+        elif state in (STATE_IDLE, STATE_ERROR, STATE_COMPLETE):
             self._hide_progress()
 
         # Start/stop pulsing based on state
@@ -159,7 +161,7 @@ class StatusBarWidget(QtWidgets.QFrame):
 
     def set_progress(self, percent: int):
         percent = max(0, min(100, percent))
-        if percent > 0:
+        if percent > 0 or self._state == STATE_ENCODING:
             self._show_progress()
             self.progress_bar.setValue(percent)
         else:
@@ -229,7 +231,7 @@ class StatusBarWidget(QtWidgets.QFrame):
                 self._hide_progress()
             else:
                 self.set_state(previous_state, previous_message)
-                if previous_visible and previous_progress > 0:
+                if previous_visible:
                     self.set_progress(previous_progress)
                 else:
                     self._hide_progress()
