@@ -4,6 +4,7 @@ from unittest import mock
 
 from pytest import approx
 
+from fastflix.encoders.common.helpers import Command
 from fastflix.encoders.vvc import chunked
 from fastflix.encoders.vvc.command_builder import build
 from fastflix.models.encode import VVCSettings
@@ -48,6 +49,21 @@ def test_chunked_command_takes_the_single_encode_apart():
     assert plan["encode_args"][:2] == ["-c:v", "libvvenc"] and "-vvenc-params" in plan["encode_args"]
     assert "-threads" not in plan["encode_args"]  # every chunk gets the chunk threads instead of the 24
     assert plan["final_args"][:2] == ["-max_muxing_queue_size", "1024"] and plan["final_args"][-1] == "out.mkv"
+
+
+def test_raw_commands_show_the_steps_the_driver_runs():
+    command = _build()[0]
+    plan = chunked.decode_plan(command.command[2])
+    names = [name for name, _ in command.steps]
+    assert names[0].startswith("Each of the 6 chunk encoders (4 threads)") and names[2:] == ["Join the chunks", "Mux"]
+    encoder = command.steps[0][1]
+    assert encoder[encoder.index("-ss") + 1] == "<chunk start> - 10 s"
+    assert "[0:0]trim=start=<chunk start>:end=<chunk end>,setpts=PTS-STARTPTS,crop=" in " ".join(encoder)
+    assert encoder[encoder.index("-c:v") :][: len(plan["encode_args"])] == plan["encode_args"]
+    assert command.steps[1][1] == chunked.side_command(plan, chunked.work_folder(plan) / chunked.SIDE_FILE_NAME)
+    video_only = {**plan, "final_args": ["out.mkv"]}
+    assert [name for name, _ in chunked.preview_steps(video_only)][1:] == ["Join the chunks", "Mux"]
+    assert Command(command=["ffmpeg"]).steps == []  # queued before the field existed
 
 
 def test_chunking_only_at_constant_qp():

@@ -20,7 +20,7 @@ from fastflix.encoders.common.hdr_metadata import (
     valid_color_transfers,
 )
 from fastflix.encoders.common.helpers import Command, generate_all, null
-from fastflix.encoders.vvc.chunked import encode_plan
+from fastflix.encoders.vvc.chunked import encode_plan, preview_steps
 from fastflix.models.encode import VVCSettings
 from fastflix.models.fastflix import FastFlix
 
@@ -203,7 +203,12 @@ def chunked_command(fastflix: FastFlix, beginning: list[str], encode_args: list[
         "resume_root": str(fastflix.config.work_path / "chunked"),
     }
     driver = Path(__file__).with_name("chunked.py")
-    return Command(command=[sys.executable, str(driver), encode_plan(plan)], name="Chunked encode", exe="python")
+    return Command(
+        command=[sys.executable, str(driver), encode_plan(plan)],
+        name="Chunked encode: runs the steps above",
+        exe="python",
+        steps=preview_steps(plan),
+    )
 
 
 def build(fastflix: FastFlix):

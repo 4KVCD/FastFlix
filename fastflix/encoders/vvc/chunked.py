@@ -170,13 +170,25 @@ def find_splits(plan, start, end, start_offset):
 # ---- Encoding ----
 
 
+def time_arg(seconds):
+    """A time for an FFmpeg argument; a str is preview_steps' placeholder, shown as it is."""
+    return seconds if isinstance(seconds, str) else f"{seconds:.6f}"
+
+
+def seek_arg(trim_start, start_offset):
+    """-ss of a chunk: SEEK_MARGIN_SECONDS before its first frame, which trim then cuts exactly."""
+    if isinstance(trim_start, str):
+        return f"{trim_start} - {SEEK_MARGIN_SECONDS} s"
+    return time_arg(max(trim_start - start_offset - SEEK_MARGIN_SECONDS, 0))
+
+
 def trimmed_video_args(plan, trim_start, trim_end):
     """The chunk's video arguments with trim + setpts as the first filters of the video chain."""
     parts = []
     if trim_start is not None:
-        parts.append(f"start={trim_start:.6f}")
+        parts.append(f"start={time_arg(trim_start)}")
     if trim_end is not None:
-        parts.append(f"end={trim_end:.6f}")
+        parts.append(f"end={time_arg(trim_end)}")
     trim = f"trim={':'.join(parts)},setpts=PTS-STARTPTS" if parts else "setpts=PTS-STARTPTS"
     args = list(plan["video_args"])
     if "-filter_complex" in args:
@@ -191,7 +203,7 @@ def trimmed_video_args(plan, trim_start, trim_end):
 def chunk_command(plan, trim_start, trim_end, start_offset, output):
     command = [plan["ffmpeg"], "-hide_banner", "-nostdin", "-y", "-copyts"]
     if trim_start is not None:
-        command += ["-ss", f"{max(trim_start - start_offset - SEEK_MARGIN_SECONDS, 0):.6f}"]
+        command += ["-ss", seek_arg(trim_start, start_offset)]
     command += ["-i", plan["source"]]
     command += trimmed_video_args(plan, trim_start, trim_end)
     command += plan["encode_args"] + ["-threads", str(plan["threads"])]
@@ -579,6 +591,19 @@ def file_stamp(path):
         return [str(path), None, None]
 
 
+SIDE_FILE_NAME = "audio_subtitles.mkv"
+
+
+def side_command(plan, path):
+    """FFmpeg writing the audio, subtitles and chapters (with the user's trim) into path; None when the output has no
+    streams but the video."""
+    final_args = plan["final_args"][:-1]  # without the output file
+    if "-map" not in final_args:
+        return None
+    command = [plan["ffmpeg"], "-hide_banner", "-nostdin", "-y", *plan["final_inputs"]]
+    return command + without_video_stream(final_args) + ["-nostats", "-progress", "pipe:1", str(path)]
+
+
 class SideFile:
     """The audio, subtitles and chapters (with the user's trim), written by FFmpeg into a side file alongside the chunk
     encoders. Its size counts in the progress line from the start (see estimate). Kept for a resume while its command,
@@ -589,13 +614,11 @@ class SideFile:
         self.range_seconds = range_seconds
         self.encoder = None
         self.path = None  # None: the output has no streams but the video
-        final_args = plan["final_args"][:-1]  # without the output file
-        if "-map" not in final_args:
+        command = side_command(plan, work_dir / SIDE_FILE_NAME)
+        if command is None:
             return
-        self.path = work_dir / "audio_subtitles.mkv"
+        self.path = work_dir / SIDE_FILE_NAME
         self.marker = self.path.with_suffix(".json")
-        command = [plan["ffmpeg"], "-hide_banner", "-nostdin", "-y", *plan["final_inputs"]]
-        command += without_video_stream(final_args) + ["-nostats", "-progress", "pipe:1", str(self.path)]
         inputs = [arg for flag, arg in zip(command, command[1:]) if flag == "-i"]
         self.record = {"command": command, "files": [file_stamp(path) for path in [plan["ffmpeg"], *inputs]]}
         if self.path.exists() and read_json(self.marker) == self.record:
@@ -671,11 +694,38 @@ def join_and_mux(plan, outputs, work_dir, side):
     """FFmpeg cannot stream-copy VVC between Matroska files without losing timestamps (FFmpeg 9), so mkvmerge appends
     the chunks and puts the video and the finished side file (SideFile) together."""
     video = work_dir / "video.mkv"
-    appended = [part for output in outputs for part in ("+", str(output))][1:]
-    if not run_step("joining the chunks", [plan["mkvmerge"], "-q", "-o", str(video), *appended], MKVMERGE_WARNING):
+    if not run_step("joining the chunks", join_command(plan, outputs, video), MKVMERGE_WARNING):
         return False
-    sources = [str(video)] if side.path is None else [str(video), str(side.path)]
-    return run_step("muxing", [plan["mkvmerge"], "-q", "-o", plan["output"], *sources], MKVMERGE_WARNING)
+    return run_step("muxing", mux_command(plan, video, side.path), MKVMERGE_WARNING)
+
+
+def join_command(plan, parts, video):
+    """mkvmerge appending the chunks' parts in video order into one video file."""
+    appended = [part for output in parts for part in ("+", str(output))][1:]
+    return [plan["mkvmerge"], "-q", "-o", str(video), *appended]
+
+
+def mux_command(plan, video, side_path):
+    """mkvmerge putting the joined video and the side file (None: none) into the output."""
+    sources = [str(video)] if side_path is None else [str(video), str(side_path)]
+    return [plan["mkvmerge"], "-q", "-o", plan["output"], *sources]
+
+
+def preview_steps(plan):
+    """[name, command] of what the driver runs for this plan, for the Raw Commands tab: built by the functions the
+    driver uses, with placeholders where the values are found at run time (split points, part numbers)."""
+    work_dir = work_folder(plan)
+    chunks = plan["chunks"]
+    parts = [work_dir / f"chunk_<{n}>_part_<k>.mkv" for n in (1, chunks)]
+    encoder = chunk_command(plan, "<chunk start>", "<chunk end>", 0, work_dir / "chunk_<n>_part_<k>.mkv")
+    steps = [[f"Each of the {chunks} chunk encoders ({plan['threads']} threads), on its part of the video", encoder]]
+    side = side_command(plan, work_dir / SIDE_FILE_NAME)
+    if side is not None:
+        steps.append(["Audio, subtitles and chapters, alongside the chunk encoders", side])
+    video = work_dir / "video.mkv"
+    steps.append(["Join the chunks", join_command(plan, [parts[0], "...", parts[1]], video)])
+    steps.append(["Mux", mux_command(plan, video, None if side is None else work_dir / SIDE_FILE_NAME)])
+    return steps
 
 
 def join_problems(frame_times_out, frame_duration):

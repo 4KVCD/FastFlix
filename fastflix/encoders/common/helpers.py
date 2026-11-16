@@ -50,6 +50,9 @@ class Command(BaseModel):
     exe: str = None
     shell: bool = False
     uuid: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    # Display only, never run: [name, command] of what this command runs itself (a chunked VVC encode's driver), shown
+    # in Raw Commands and the job settings because the command is unreadable
+    steps: List[List[Union[str, List[str]]]] = []
 
     def to_list(self) -> List[str]:
         """Convert command to a list suitable for Popen."""

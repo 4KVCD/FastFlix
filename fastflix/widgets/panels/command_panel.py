@@ -142,6 +142,8 @@ class CommandList(QtWidgets.QWidget):
         self.commands = []
         for index, item in enumerate(commands, 1):
             if item.item == "command":
+                for name, step in item.steps:  # readable, display only; Copy and Save take the real command
+                    layout.addWidget(Command(self.scroll_area, _command_to_display_string(step), index, name=name))
                 new_item = Command(self.scroll_area, _command_to_display_string(item.command), index, name=item.name)
                 self.commands.append(item)
                 layout.addWidget(new_item)

@@ -54,7 +54,12 @@ def job_settings_text(video: Video) -> str:
     section(t("Subtitles"), [_subtitle_line(x) for x in video.subtitle_tracks if x.enabled])
     section(
         t("Commands"),
-        [f"{i}. {_command_to_display_string(c.command)}" for i, c in enumerate(settings.conversion_commands, 1)],
+        [
+            line
+            for i, c in enumerate(settings.conversion_commands, 1)
+            for line in [f"{i}. {name}: {_command_to_display_string(step)}" for name, step in c.steps]
+            + [f"{i}. {_command_to_display_string(c.command)}"]
+        ],
     )
     return "\n".join(lines)
 
