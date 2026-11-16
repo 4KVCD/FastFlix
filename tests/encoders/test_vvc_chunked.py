@@ -99,23 +99,53 @@ def test_size_estimate_projects_the_video_and_adds_the_whole_side_file():
     assert "size=5859KiB " in line  # what is on disk: video so far + side file
 
 
+class _FakeProcess:
+    def __init__(self, code):
+        self.code = code
+
+    def poll(self):
+        return self.code
+
+
+def _side_file(tmp_path, plan, code=0):
+    def start(command, error_file):
+        Path(command[-1]).write_bytes(b"audio")
+        encoder = mock.Mock(process=_FakeProcess(code))
+        encoder.last_errors.return_value = ["error"]
+        encoder.number = {"out_time_us": 1e6, "total_size": 5}.get
+        return encoder
+
+    with (
+        mock.patch.object(chunked, "ChunkEncoder", side_effect=start) as encoders,
+        mock.patch.object(chunked, "record_processes"),
+        mock.patch.object(chunked, "log"),
+    ):
+        side = chunked.SideFile(plan, tmp_path, 100.0)
+        return side, side.poll(), encoders.call_count
+
+
 def test_side_file_is_made_once_and_again_when_its_inputs_change(tmp_path):
     source = tmp_path / "in.mkv"
     source.write_bytes(b"a")
     plan = {"ffmpeg": "ffmpeg", "final_inputs": ["-i", str(source)], "final_args": ["-map", "0:1", "out.mkv"]}
+    assert _side_file(tmp_path, plan)[1:] == (True, 1)
+    assert _side_file(tmp_path, plan)[1:] == (True, 0)  # kept on a resume: no FFmpeg
+    source.write_bytes(b"changed")
+    assert _side_file(tmp_path, plan)[1:] == (True, 1)
+    assert _side_file(tmp_path, {**plan, "final_args": ["-map", "0:2", "out.mkv"]})[1:] == (True, 1)
+    side, finished, started = _side_file(tmp_path, {**plan, "final_args": ["out.mkv"]})  # video only
+    assert (side.path, finished, started, side.estimate()) == (None, True, 0, (0, 100.0))
+    assert _side_file(tmp_path, {**plan, "final_args": ["-map", "0:3", "out.mkv"]}, code=1)[1] is False
+    assert _side_file(tmp_path, {**plan, "final_args": ["-map", "0:3", "out.mkv"]})[1:] == (True, 1)  # not kept
 
-    def run_step(name, command, warning_exit_code=None, work_dir=None):
-        Path(command[-1]).write_bytes(b"audio")
-        return True
 
-    with mock.patch.object(chunked, "run_step", side_effect=run_step) as step, mock.patch.object(chunked, "log"):
-        side = chunked.make_side_file(plan, tmp_path)
-        assert chunked.make_side_file(plan, tmp_path) == side and step.call_count == 1  # kept on a resume
-        source.write_bytes(b"changed")
-        assert chunked.make_side_file(plan, tmp_path) == side and step.call_count == 2
-        assert chunked.make_side_file({**plan, "final_args": ["-map", "0:2", "out.mkv"]}, tmp_path)
-        assert step.call_count == 3
-        assert chunked.make_side_file({**plan, "final_args": ["out.mkv"]}, tmp_path) is None  # video only
+def test_running_side_file_is_projected_to_the_end_once_past_the_headers(tmp_path):
+    side = chunked.SideFile({"final_args": ["out.mkv"]}, tmp_path, 100.0)
+    side.path, side.encoder = tmp_path / "side.mkv", mock.Mock()
+    side.encoder.number = {"out_time_us": 10e6, "total_size": 2e6}.get
+    assert side.estimate() == (20e6, 100.0)  # 2 MB in 10 of 100 s
+    side.encoder.number = {"out_time_us": 1e6, "total_size": 1e6}.get
+    assert side.estimate() == (0, 100.0)  # 1 % in: chapters and headers would inflate it
 
 
 def test_salvage_keeps_the_frames_coded_before_the_last_usable_keyframe():
@@ -207,18 +237,18 @@ class _FakeEncoder:
         self.code = -9
 
 
-def _encode_tail(tmp_path, script, tail_range):
+def _encode_tail(tmp_path, script, tail_range, side=None):
     _FakeEncoder.script = list(script)
     jobs = [(0, chunked.part_path(tmp_path, 0, 0), None, 50.0), (1, chunked.part_path(tmp_path, 1, 0), 50.0, None)]
     plan = {"ffmpeg": "ffmpeg", "source": "in.mkv", "video_args": [], "encode_args": [], "threads": 2, "chunks": 4}
     with (
         mock.patch.object(chunked, "ChunkEncoder", _FakeEncoder),
-        mock.patch.object(chunked, "record_encoders"),
+        mock.patch.object(chunked, "record_processes"),
         mock.patch.object(chunked, "log"),
         mock.patch.object(chunked.time, "sleep"),
         mock.patch.object(chunked.time, "monotonic", side_effect=[0.0] + [60.0] * 50),
     ):
-        return chunked.encode_parts(plan, jobs, 2, 0.0, 0.04, 0, 0, tmp_path, tail_range)
+        return chunked.encode_parts(plan, jobs, 2, 0.0, 0.04, 0, 0, tmp_path, tail_range, side)
 
 
 def test_the_last_chunk_running_is_stopped_for_a_resplit_only_with_much_left(tmp_path):
@@ -230,6 +260,13 @@ def test_the_last_chunk_running_is_stopped_for_a_resplit_only_with_much_left(tmp
         assert _encode_tail(tmp_path, [(2, 1250), (5, 100)], (0.0, 100.0)) == ("done", None)
     with mock.patch.object(chunked, "RESPLIT_MIN_SECONDS", 600):  # already split once in this job: never again
         assert _encode_tail(tmp_path, [(2, 1250), (5, 100)], None) == ("done", None)
+
+
+def test_a_failed_side_file_stops_the_chunk_encoders(tmp_path):
+    side = mock.Mock(running=lambda: [], estimate=lambda: (0, 100.0))
+    side.poll.return_value = False  # its FFmpeg exited with an error
+    assert _encode_tail(tmp_path, [(None, 10), (None, 10)], None, side) == ("failed", None)
+    assert not list(tmp_path.glob("*.json"))  # no chunk marked as finished
 
 
 def test_join_check_finds_a_lost_and_a_doubled_frame():

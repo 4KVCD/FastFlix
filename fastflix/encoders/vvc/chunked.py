@@ -39,6 +39,8 @@ SEEK_MARGIN_SECONDS = 10  # the coarse input seek lands this much before the chu
 PROGRESS_INTERVAL_SECONDS = 2
 # The last chunk still encoding is stopped and its rest split again when it has more than this left (once per job)
 RESPLIT_MIN_SECONDS = 15 * 60
+# The side file's size is projected to the end only once FFmpeg is this far into the range (see SideFile.estimate)
+SIDE_PROJECTION_MIN_SHARE = 0.02
 MKVMERGE_WARNING = 1  # mkvmerge's exit code when it finished with warnings
 CLUSTER_TIME_LIMIT_MS = 1000  # small Matroska clusters: a killed encoder's file loses at most the last second written
 TIME_TOLERANCE = 0.002  # Matroska stores times in whole milliseconds
@@ -263,16 +265,22 @@ def progress_line(encoders, started, frame_duration, done_frames=0, done_size=0,
     )
 
 
-def match_priority(encoders):
-    """The chunk encoders follow the driver's priority, which FastFlix sets and may change while it runs."""
+def estimate(side):
+    """progress_line's side value for a SideFile or None."""
+    return side.estimate() if side else (0, 0)
+
+
+def match_priority(processes):
+    """The chunk encoders and the side file's FFmpeg follow the driver's priority, which FastFlix sets and may change
+    while it runs."""
     try:
         own = psutil.Process().nice()
     except psutil.Error:
         return
-    for encoder in encoders:
+    for process in processes:
         try:
-            if encoder.process.nice() != own:
-                encoder.process.nice(own)
+            if process.nice() != own:
+                process.nice(own)
         except psutil.Error:
             pass
 
@@ -301,11 +309,11 @@ def write_marker(encoder, job):
 
 
 def encode_parts(
-    plan, jobs, chunk_count, start_offset, frame_duration, done_frames, done_size, work_dir, tail_range, side=(0, 0)
+    plan, jobs, chunk_count, start_offset, frame_duration, done_frames, done_size, work_dir, tail_range, side=None
 ):
     """Encodes the next part of each given chunk at once; jobs: (chunk, part path, trim start, trim end). Each
-    finished part gets its marker. Returns ("done", None), ("failed", None) or ("resplit", chunk). side: see
-    progress_line.
+    finished part gets its marker. Returns ("done", None), ("failed", None) or ("resplit", chunk). side: the
+    SideFile being written alongside (None: none), watched with the encoders and counted in the progress line.
 
     tail_range (the range's first and last time, None: no re-split) lets the last encoder still running be judged
     once, when another of these encoders has finished: with more than RESPLIT_MIN_SECONDS left at its average speed,
@@ -316,19 +324,22 @@ def encode_parts(
         command = chunk_command(plan, trim_start, trim_end, start_offset, output)
         log(f"Chunk {chunk + 1}/{chunk_count}: {subprocess.list2cmdline(command)}")
         encoders.append(ChunkEncoder(command, output.with_suffix(".log")))
-    record_encoders(work_dir, encoders)
+    side_processes = side.running() if side else []
+    record_processes(work_dir, [e.process for e in encoders] + side_processes)
 
     started = time.monotonic()
     tail_judged = tail_range is None or len(encoders) < 2
     while any(e.process.poll() is None for e in encoders):
         failed = [e for e in encoders if e.process.poll() not in (None, 0)]
-        if failed:
+        side_failed = side is not None and side.poll() is False
+        if failed or side_failed:
             for encoder in encoders:
                 if encoder.process.poll() is None:
                     encoder.process.kill()
-            log("Chunked encode: a chunk encoder failed:")
-            for line in failed[0].last_errors():
-                log(line)
+            if failed:
+                log("Chunked encode: a chunk encoder failed:")
+                for line in failed[0].last_errors():
+                    log(line)
             return "failed", None
         running = [i for i, e in enumerate(encoders) if e.process.poll() is None]
         if not tail_judged and len(running) == 1:
@@ -348,8 +359,8 @@ def encode_parts(
                         if encoder is not last:
                             write_marker(encoder, finished)
                     return "resplit", job[0]
-        match_priority(encoders)
-        log(progress_line(encoders, started, frame_duration, done_frames, done_size, side))
+        match_priority([e.process for e in encoders] + (side.running() if side else []))
+        log(progress_line(encoders, started, frame_duration, done_frames, done_size, estimate(side)))
         time.sleep(PROGRESS_INTERVAL_SECONDS)
     if any(e.process.returncode != 0 for e in encoders):
         bad = next(e for e in encoders if e.process.returncode != 0)
@@ -359,7 +370,7 @@ def encode_parts(
         return "failed", None
     for encoder, job in zip(encoders, jobs):
         write_marker(encoder, job)
-    log(progress_line(encoders, started, frame_duration, done_frames, done_size, side))
+    log(progress_line(encoders, started, frame_duration, done_frames, done_size, estimate(side)))
     return "done", None
 
 
@@ -425,11 +436,6 @@ def take_lock(work_dir):
                 pass
     write_json(lock, process_entry(psutil.Process()))
     return True
-
-
-def record_encoders(work_dir, encoders):
-    """The lock names this run's encoders, for take_lock of a later run."""
-    record_processes(work_dir, [e.process for e in encoders])
 
 
 def record_processes(work_dir, processes):
@@ -550,29 +556,16 @@ class ResumeError(Exception):
 # ---- Joining ----
 
 
-def run_step(name, command, warning_exit_code=None, work_dir=None):
-    """Run one step, logging its command and, on failure, its last error lines. mkvmerge exits with 1 for
-    warnings only (warning_exit_code). With work_dir, the process is named in the lock, so a later run stops it if
-    this driver is killed while it runs."""
+def run_step(name, command, warning_exit_code=None):
+    """Run one join step, logging its command and, on failure, its last error lines. mkvmerge exits with 1 for
+    warnings only (warning_exit_code)."""
     log(f"Chunked encode: {name}: {subprocess.list2cmdline(command)}")
-    process = psutil.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        errors="replace",
-        creationflags=NO_WINDOW,
+    result = subprocess.run(
+        command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", creationflags=NO_WINDOW
     )
-    if work_dir is not None:
-        try:
-            record_processes(work_dir, [process])
-        except psutil.Error:  # already exited
-            pass
-    stdout, stderr = process.communicate()
-    if process.returncode in (0, warning_exit_code):
+    if result.returncode in (0, warning_exit_code):
         return True
-    for line in (stderr or stdout).splitlines()[-15:]:
+    for line in (result.stderr or result.stdout).splitlines()[-15:]:
         log(line)
     return False
 
@@ -586,28 +579,79 @@ def file_stamp(path):
         return [str(path), None, None]
 
 
-def make_side_file(plan, work_dir):
-    """FFmpeg writes the audio, subtitles and chapters (with the user's trim) into a side file, at the job's start so
-    the progress line can count its size (see progress_line). Kept for a resume while its command, inputs and FFmpeg
-    build are unchanged: the work folder's name does not cover them. Returns its path, None when the output has no
-    streams but the video, False on a failure."""
-    final_args = plan["final_args"][:-1]  # without the output file
-    if "-map" not in final_args:
-        return None
-    side = work_dir / "audio_subtitles.mkv"
-    marker = side.with_suffix(".json")
-    command = [plan["ffmpeg"], "-hide_banner", "-nostdin", "-y", *plan["final_inputs"]]
-    command += without_video_stream(final_args) + [str(side)]
-    inputs = [arg for flag, arg in zip(command, command[1:]) if flag == "-i"]
-    record = {"command": command, "files": [file_stamp(path) for path in [plan["ffmpeg"], *inputs]]}
-    if side.exists() and read_json(marker) == record:
-        log("Chunked encode: the audio, subtitles and chapters file of the earlier run is kept")
-        return side
-    marker.unlink(missing_ok=True)
-    if not run_step("audio, subtitles and chapters", command, work_dir=work_dir):
-        return False
-    write_json(marker, record)
-    return side
+class SideFile:
+    """The audio, subtitles and chapters (with the user's trim), written by FFmpeg into a side file alongside the chunk
+    encoders. Its size counts in the progress line from the start (see estimate). Kept for a resume while its command,
+    inputs and FFmpeg build are unchanged (the work folder's name does not cover them): the marker holds those and is
+    written as soon as FFmpeg has finished."""
+
+    def __init__(self, plan, work_dir, range_seconds):
+        self.range_seconds = range_seconds
+        self.encoder = None
+        self.path = None  # None: the output has no streams but the video
+        final_args = plan["final_args"][:-1]  # without the output file
+        if "-map" not in final_args:
+            return
+        self.path = work_dir / "audio_subtitles.mkv"
+        self.marker = self.path.with_suffix(".json")
+        command = [plan["ffmpeg"], "-hide_banner", "-nostdin", "-y", *plan["final_inputs"]]
+        command += without_video_stream(final_args) + ["-nostats", "-progress", "pipe:1", str(self.path)]
+        inputs = [arg for flag, arg in zip(command, command[1:]) if flag == "-i"]
+        self.record = {"command": command, "files": [file_stamp(path) for path in [plan["ffmpeg"], *inputs]]}
+        if self.path.exists() and read_json(self.marker) == self.record:
+            log("Chunked encode: the audio, subtitles and chapters file of the earlier run is kept")
+            return
+        self.marker.unlink(missing_ok=True)
+        log(f"Chunked encode: audio, subtitles and chapters: {subprocess.list2cmdline(command)}")
+        self.encoder = ChunkEncoder(command, self.path.with_suffix(".log"))
+        record_processes(work_dir, self.running())  # a later run stops it if this driver is killed now
+
+    def running(self):
+        """Its FFmpeg while it runs, for the lock and the priority."""
+        return [self.encoder.process] if self.encoder and self.encoder.process.poll() is None else []
+
+    def poll(self):
+        """None while FFmpeg runs, True once the file is finished (marker written), False when FFmpeg failed."""
+        if self.encoder is None:
+            return True
+        code = self.encoder.process.poll()
+        if code is None:
+            return None
+        if code != 0:
+            log("Chunked encode: the audio, subtitles and chapters failed:")
+            for line in self.encoder.last_errors():
+                log(line)
+            return False
+        write_json(self.marker, self.record)
+        self.encoder = None
+        return True
+
+    def estimate(self):
+        """(bytes, range seconds) for progress_line: the finished file's size, or while FFmpeg runs its size so far
+        projected to the range's end; 0 until it is SIDE_PROJECTION_MIN_SHARE in, as the chapters and headers written
+        first would inflate the projection."""
+        if self.path is None:
+            return 0, self.range_seconds
+        if self.encoder is None:
+            return self.path.stat().st_size, self.range_seconds
+        seconds = self.encoder.number("out_time_us") / 1e6
+        if seconds <= 0 or seconds < SIDE_PROJECTION_MIN_SHARE * self.range_seconds:
+            return 0, self.range_seconds
+        return self.encoder.number("total_size") * self.range_seconds / seconds, self.range_seconds
+
+    def stop(self):
+        for process in self.running():
+            process.kill()
+            process.wait()
+
+
+def wait_for_side_file(side, frame_duration, done_frames, done_size):
+    """After the chunks: progress lines go on until the side file is finished. True when it is."""
+    started = time.monotonic()
+    while (finished := side.poll()) is None:
+        log(progress_line([], started, frame_duration, done_frames, done_size, side.estimate()))
+        time.sleep(PROGRESS_INTERVAL_SECONDS)
+    return finished
 
 
 STREAM_SPECIFIER = re.compile(r"^(-[A-Za-z_]+(?::s)?):(\d+)$")
@@ -625,12 +669,12 @@ def without_video_stream(args):
 
 def join_and_mux(plan, outputs, work_dir, side):
     """FFmpeg cannot stream-copy VVC between Matroska files without losing timestamps (FFmpeg 9), so mkvmerge appends
-    the chunks and puts the video and the side file (make_side_file; None: none) together."""
+    the chunks and puts the video and the finished side file (SideFile) together."""
     video = work_dir / "video.mkv"
     appended = [part for output in outputs for part in ("+", str(output))][1:]
     if not run_step("joining the chunks", [plan["mkvmerge"], "-q", "-o", str(video), *appended], MKVMERGE_WARNING):
         return False
-    sources = [str(video)] if side is None else [str(video), str(side)]
+    sources = [str(video)] if side.path is None else [str(video), str(side.path)]
     return run_step("muxing", [plan["mkvmerge"], "-q", "-o", plan["output"], *sources], MKVMERGE_WARNING)
 
 
@@ -776,12 +820,17 @@ def run_locked(plan, work_dir):
     # The source's pace, for the progress time and the join check; averaged, as Matroska stores times in whole ms
     frame_duration = (head[-1] - head[0]) / (len(head) - 1)
 
-    range_times = (start + start_offset, end + start_offset)
+    side = SideFile(plan, work_dir, end - start)  # its FFmpeg runs alongside the scene scan and the chunk encoders
+    try:
+        return encode_and_join(
+            plan, work_dir, side, start_offset, (start + start_offset, end + start_offset), frame_duration
+        )
+    finally:
+        side.stop()  # only still running when the job failed
+
+
+def encode_and_join(plan, work_dir, side, start_offset, range_times, frame_duration):
     state = chunk_state(plan, work_dir, range_times, start_offset)
-    side_file = make_side_file(plan, work_dir)
-    if side_file is False:
-        return 1
-    side = (side_file.stat().st_size if side_file else 0, end - start)
     first_pass = True
     while True:
         done, stopped = encode_chunks(
@@ -794,10 +843,14 @@ def run_locked(plan, work_dir):
             break
         state = resplit(plan, work_dir, state, stopped, range_times, start_offset, frame_duration)
 
-    outputs = [part for chunk in join_order(state["ranges"]) for part, _ in done[chunk]]
-    if not join_and_mux(plan, outputs, work_dir, side_file):
+    frames = sum(frames for parts in done for _, frames in parts)
+    size = sum(part.stat().st_size for parts in done for part, _ in parts)
+    if not wait_for_side_file(side, frame_duration, frames, size):
         return 1
-    if not check_output(plan, plan["output"], frame_duration, sum(frames for parts in done for _, frames in parts)):
+    outputs = [part for chunk in join_order(state["ranges"]) for part, _ in done[chunk]]
+    if not join_and_mux(plan, outputs, work_dir, side):
+        return 1
+    if not check_output(plan, plan["output"], frame_duration, frames):
         return 1
     shutil.rmtree(work_dir, ignore_errors=True)
     return 0
