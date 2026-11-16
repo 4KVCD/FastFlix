@@ -89,6 +89,35 @@ def test_progress_time_counts_every_chunks_frames():
     assert "time=00:00:10.00 " in line
 
 
+def test_size_estimate_projects_the_video_and_adds_the_whole_side_file():
+    # 240 of 2400 frames (10 of 100 s) encoded into 1 MB; the audio/subtitles file of the whole range is 5 MB
+    encoder = mock.Mock(values={})
+    encoder.number = {"frame": 240, "total_size": 1e6}.get
+    line = chunked.progress_line([encoder], started=0.0, frame_duration=1 / 24, side=(5e6, 100.0))
+    kbits = float(line.split("bitrate=")[1].split("k")[0])
+    assert 100.0 * kbits / 8000 == approx(10e6 / 1e6 + 5e6 / 1e6, rel=1e-3)  # FastFlix: length x bitrate, in MB
+    assert "size=5859KiB " in line  # what is on disk: video so far + side file
+
+
+def test_side_file_is_made_once_and_again_when_its_inputs_change(tmp_path):
+    source = tmp_path / "in.mkv"
+    source.write_bytes(b"a")
+    plan = {"ffmpeg": "ffmpeg", "final_inputs": ["-i", str(source)], "final_args": ["-map", "0:1", "out.mkv"]}
+
+    def run_step(name, command, warning_exit_code=None, work_dir=None):
+        Path(command[-1]).write_bytes(b"audio")
+        return True
+
+    with mock.patch.object(chunked, "run_step", side_effect=run_step) as step, mock.patch.object(chunked, "log"):
+        side = chunked.make_side_file(plan, tmp_path)
+        assert chunked.make_side_file(plan, tmp_path) == side and step.call_count == 1  # kept on a resume
+        source.write_bytes(b"changed")
+        assert chunked.make_side_file(plan, tmp_path) == side and step.call_count == 2
+        assert chunked.make_side_file({**plan, "final_args": ["-map", "0:2", "out.mkv"]}, tmp_path)
+        assert step.call_count == 3
+        assert chunked.make_side_file({**plan, "final_args": ["out.mkv"]}, tmp_path) is None  # video only
+
+
 def test_salvage_keeps_the_frames_coded_before_the_last_usable_keyframe():
     d = 1 / 24
     # decode order of a random-access stream (frame numbers): keyframe 0, frames 4, 2, 1, 3, then keyframe 8 whose
