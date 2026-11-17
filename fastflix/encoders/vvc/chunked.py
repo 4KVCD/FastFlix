@@ -44,6 +44,13 @@ SIDE_PROJECTION_MIN_SHARE = 0.02
 MKVMERGE_WARNING = 1  # mkvmerge's exit code when it finished with warnings
 CLUSTER_TIME_LIMIT_MS = 1000  # small Matroska clusters: a killed encoder's file loses at most the last second written
 TIME_TOLERANCE = 0.002  # Matroska stores times in whole milliseconds
+# A part whose frames end more than this before its range end stopped early (its range is split between frames)
+EARLY_END_SECONDS = 1.0
+# The side file is made again when its audio ends this much before the range (at least SIDE_EARLY_END_SECONDS), at
+# most SIDE_RERUNS times; then it is kept with a warning, as some files' audio really ends early
+SIDE_EARLY_END_SHARE = 0.01
+SIDE_EARLY_END_SECONDS = 10.0
+SIDE_RERUNS = 2
 # FastFlix runs this driver with pythonw, which has no console: without this flag Windows opens a visible console
 # window for every FFmpeg, ffprobe and mkvmerge it starts (and closing one kills that chunk)
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -297,20 +304,53 @@ def seconds_left(frames, expected_frames, elapsed):
     return max(expected_frames - frames, 0) / (frames / elapsed)
 
 
-def write_marker(encoder, job):
-    """The finished part's marker; its frame count is the encoder's last progress block."""
-    _, output, trim_start, _ = job
+def part_shortfall(plan, job, part_range, frame_duration):
+    """Seconds of its range a finished part lacks: FFmpeg exits 0 when the source cannot be read further (e.g. a
+    network share dropping out: "Error during demuxing"), leaving a part that ends early. Judged from the frames in
+    the file, as the encoder's own out_time trails them by its reorder delay. part_range = (the range's first time,
+    the end of the source's last video frame); 0 when that end is unknown and the part runs to it."""
+    _, output, _, trim_end = job
+    if trim_end is None and part_range[1] is None:
+        return 0.0
+    times = [pts for pts, _ in packet_list(plan["ffprobe"], output)]
+    covered = max(times) - min(times) + frame_duration if times else 0.0
+    return max(part_seconds(job, part_range) - covered, 0.0)
+
+
+def write_marker(plan, encoder, job, part_range, frame_duration):
+    """The finished part's marker, its frame count the encoder's last progress block. A part that ended early gets
+    none (False): resume salvages it and the chunk goes on from its last usable keyframe, as after a kill."""
+    chunk, output, trim_start, _ = job
     encoder.reader.join(timeout=5)
+    missing = part_shortfall(plan, job, part_range, frame_duration)
+    if missing > EARLY_END_SECONDS:
+        log(
+            f"Chunked encode: chunk {chunk + 1} stopped {missing:.1f} s before its end (could the source not be "
+            f"read?); it is continued from there"
+        )
+        return False
     frames = int(encoder.number("frame"))
     write_json(marker_path(output), {"frames": frames, "complete": True, "trim_start": trim_start})
+    return True
 
 
 def encode_parts(
-    plan, jobs, chunk_count, start_offset, frame_duration, done_frames, done_size, work_dir, tail_range, side=None
+    plan,
+    jobs,
+    chunk_count,
+    start_offset,
+    frame_duration,
+    done_frames,
+    done_size,
+    work_dir,
+    part_range,
+    tail_range,
+    side=None,
 ):
     """Encodes the next part of each given chunk at once; jobs: (chunk, part path, trim start, trim end). Each
-    finished part gets its marker. Returns ("done", None), ("failed", None) or ("resplit", chunk). side: the
-    SideFile being written alongside (None: none), watched with the encoders and counted in the progress line.
+    finished part gets its marker unless it ended early (write_marker; part_range: see part_shortfall). Returns
+    ("done", None), ("failed", None) or ("resplit", chunk). side: the SideFile being written alongside (None: none),
+    watched with the encoders and counted in the progress line.
 
     tail_range (the range's first and last time, None: no re-split) lets the last encoder still running be judged
     once, when another of these encoders has finished: with more than RESPLIT_MIN_SECONDS left at its average speed,
@@ -354,7 +394,7 @@ def encode_parts(
                     last.process.wait()
                     for encoder, finished in zip(encoders, jobs):
                         if encoder is not last:
-                            write_marker(encoder, finished)
+                            write_marker(plan, encoder, finished, part_range, frame_duration)
                     return "resplit", job[0]
         log(progress_line(encoders, started, frame_duration, done_frames, done_size, estimate(side)))
         time.sleep(PROGRESS_INTERVAL_SECONDS)
@@ -365,7 +405,7 @@ def encode_parts(
             log(line)
         return "failed", None
     for encoder, job in zip(encoders, jobs):
-        write_marker(encoder, job)
+        write_marker(plan, encoder, job, part_range, frame_duration)
     log(progress_line(encoders, started, frame_duration, done_frames, done_size, estimate(side)))
     return "done", None
 
@@ -434,10 +474,12 @@ def take_lock(work_dir):
     return True
 
 
-def record_processes(work_dir, processes):
-    """The lock names this run's child processes (psutil.Popen); take_lock of a later run stops those still running."""
+def record_processes(work_dir, processes, recorded=()):
+    """The lock names this run's child processes (psutil.Popen; recorded: entries already named, kept); take_lock of
+    a later run stops those still running."""
     lock = work_dir / "lock.json"
-    write_json(lock, {**process_entry(psutil.Process()), "encoders": [process_entry(p) for p in processes]})
+    entries = [*recorded, *(process_entry(p) for p in processes)]
+    write_json(lock, {**process_entry(psutil.Process()), "encoders": entries})
 
 
 def part_path(work_dir, chunk, part):
@@ -609,9 +651,15 @@ class SideFile:
             log("Chunked encode: the audio, subtitles and chapters file of the earlier run is kept")
             return
         self.marker.unlink(missing_ok=True)
+        self.command, self.work_dir, self.ffprobe, self.reruns = command, work_dir, plan["ffprobe"], 0
         log(f"Chunked encode: audio, subtitles and chapters: {subprocess.list2cmdline(command)}")
-        self.encoder = ChunkEncoder(command, self.path.with_suffix(".log"))
-        record_processes(work_dir, self.running())  # a later run stops it if this driver is killed now
+        self.start()
+
+    def start(self):
+        self.encoder = ChunkEncoder(self.command, self.path.with_suffix(".log"))
+        # A later run stops it if this driver is killed now. Made again (reruns), it joins the chunk encoders there.
+        recorded = (read_json(self.work_dir / "lock.json") or {}).get("encoders", []) if self.reruns else []
+        record_processes(self.work_dir, self.running(), recorded)
 
     def running(self):
         """Its FFmpeg while it runs, for the lock and the priority."""
@@ -629,9 +677,34 @@ class SideFile:
             for line in self.encoder.last_errors():
                 log(line)
             return False
+        missing = self.shortfall()
+        if missing:
+            if self.reruns < SIDE_RERUNS:
+                self.reruns += 1
+                log(
+                    f"Chunked encode: the audio ended {missing:.0f} s early (could the source not be read?): made again"
+                )
+                self.start()
+                return None
+            log(f"Chunked encode: the audio ends {missing:.0f} s before the video, also when made again: kept")
         write_json(self.marker, self.record)
         self.encoder = None
         return True
+
+    def shortfall(self):
+        """Seconds the finished file's audio ends before the range's end when that is more than the allowance (FFmpeg
+        exits 0 when the source cannot be read further), else 0. Also 0 when no time was reported or the file has no
+        audio: subtitles and chapters end where they end."""
+        self.encoder.reader.join(timeout=5)
+        seconds = self.encoder.number("out_time_us") / 1e6
+        missing = self.range_seconds - seconds
+        if seconds <= 0 or missing <= max(SIDE_EARLY_END_SECONDS, SIDE_EARLY_END_SHARE * self.range_seconds):
+            return 0.0
+        audio = run_quiet(
+            [self.ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index", "-of", "csv=p=0",
+             str(self.path)]
+        )  # fmt: skip
+        return missing if audio.stdout.strip() else 0.0
 
     def estimate(self):
         """(bytes, range seconds) for progress_line: the finished file's size, or while FFmpeg runs its size so far
@@ -804,11 +877,8 @@ def resplit(plan, work_dir, state, chunk, range_times, start_offset, frame_durat
     return state
 
 
-def encode_chunks(plan, work_dir, state, range_times, start_offset, frame_duration, first_pass, side):
-    """Resumes every chunk and encodes what is left. Returns (each chunk's parts, None) when all are encoded,
-    (parts, chunk) when the last chunk still running was stopped for a re-split, (None, None) on a failure.
-    side: see progress_line."""
-    ranges = state["ranges"]
+def resume_chunks(plan, work_dir, ranges, start_offset, frame_duration):
+    """Each chunk's parts so far, and the jobs (chunk, part path, trim start, trim end) that encode the rest."""
     done, jobs = [], []
     for chunk, (chunk_start, chunk_end) in enumerate(ranges):
         parts, next_part = resume_chunk(plan, work_dir, chunk, chunk_start, chunk_end, start_offset, frame_duration)
@@ -817,29 +887,51 @@ def encode_chunks(plan, work_dir, state, range_times, start_offset, frame_durati
             output, trim_start = next_part
             marker_path(output).unlink(missing_ok=True)  # a stale marker must not mark the new part finished
             jobs.append((chunk, output, trim_start, chunk_end))
-    done_frames = sum(frames for parts in done for _, frames in parts)
-    if done_frames and first_pass:
-        log(f"Chunked encode: resuming with {done_frames} frames kept from the earlier run")
-    # A PC without the RAM for every chunk's encoder at once runs them in batches (each 4K encoder holds about 10 GB).
-    # The chunks' commands stay the same, so the output does too.
-    batch_size = plan.get("max_parallel") or max(len(jobs), 1)
-    for first in range(0, len(jobs), batch_size):
-        batch = jobs[first : first + batch_size]
-        last_batch = first + batch_size >= len(jobs)
-        tail_range = range_times if last_batch and not state.get("resplit") else None
-        done_frames = sum(frames for parts in done for _, frames in parts)
-        done_size = sum(part.stat().st_size for parts in done for part, _ in parts)
-        status, stopped = encode_parts(
-            plan, batch, len(ranges), start_offset, frame_duration, done_frames, done_size, work_dir, tail_range, side
-        )
-        if status == "failed":
+    return done, jobs
+
+
+def encode_chunks(plan, work_dir, state, range_times, part_range, start_offset, frame_duration, first_pass, side):
+    """Resumes every chunk and encodes what is left. Returns (each chunk's parts, None) when all are encoded,
+    (parts, chunk) when the last chunk still running was stopped for a re-split, (None, None) on a failure.
+    A part that ended early (write_marker) is continued in another round, as long as each round keeps more frames
+    than the one before. part_range: see part_shortfall; side: see progress_line."""
+    ranges = state["ranges"]
+    kept_before = None
+    while True:
+        done, jobs = resume_chunks(plan, work_dir, ranges, start_offset, frame_duration)
+        kept = sum(frames for parts in done for _, frames in parts)
+        if kept_before is None and kept and first_pass:
+            log(f"Chunked encode: resuming with {kept} frames kept from the earlier run")
+        if kept_before is not None and kept <= kept_before:
+            log("Chunked encode: no frames gained since a chunk stopped early: the source cannot be read further")
             return None, None
-        for chunk, output, _, _ in batch:
-            if chunk != stopped:
-                done[chunk].append((output, read_json(marker_path(output))["frames"]))
-        if status == "resplit":
-            return done, stopped
-    return done, None
+        kept_before = kept
+        # A PC without the RAM for every chunk's encoder at once runs them in batches (each 4K encoder holds about
+        # 10 GB). The chunks' commands stay the same, so the output does too.
+        batch_size = plan.get("max_parallel") or max(len(jobs), 1)
+        ended_early = False
+        for first in range(0, len(jobs), batch_size):
+            batch = jobs[first : first + batch_size]
+            last_batch = first + batch_size >= len(jobs)
+            tail_range = range_times if last_batch and not state.get("resplit") else None
+            done_frames = sum(frames for parts in done for _, frames in parts)
+            done_size = sum(part.stat().st_size for parts in done for part, _ in parts)
+            status, stopped = encode_parts(
+                plan, batch, len(ranges), start_offset, frame_duration, done_frames, done_size, work_dir, part_range,
+                tail_range, side,
+            )  # fmt: skip
+            if status == "failed":
+                return None, None
+            for chunk, output, _, _ in batch:
+                marker = read_json(marker_path(output))
+                if marker:
+                    done[chunk].append((output, marker["frames"]))
+                elif chunk != stopped:
+                    ended_early = True
+            if status == "resplit":
+                return done, stopped  # the next call resumes a part that ended early, with the re-split ranges
+        if not ended_early:
+            return done, None
 
 
 def run_locked(plan, work_dir):
@@ -854,21 +946,28 @@ def run_locked(plan, work_dir):
     # The source's pace, for the progress time and the join check; averaged, as Matroska stores times in whole ms
     frame_duration = (head[-1] - head[0]) / (len(head) - 1)
 
+    range_times = (start + start_offset, end + start_offset)
+    part_range = (range_times[0], range_times[1] if plan["end"] else video_end(plan, range_times[1], frame_duration))
     side = SideFile(plan, work_dir, end - start)  # its FFmpeg runs alongside the scene scan and the chunk encoders
     try:
-        return encode_and_join(
-            plan, work_dir, side, start_offset, (start + start_offset, end + start_offset), frame_duration
-        )
+        return encode_and_join(plan, work_dir, side, start_offset, range_times, part_range, frame_duration)
     finally:
         side.stop()  # only still running when the job failed
 
 
-def encode_and_join(plan, work_dir, side, start_offset, range_times, frame_duration):
+def video_end(plan, file_end, frame_duration):
+    """End of the source's last video frame (absolute), None when it cannot be read: the file's duration also covers
+    audio that runs longer."""
+    times = frame_times(plan["ffprobe"], plan["source"], file_end - 60, 120)
+    return times[-1] + frame_duration if times else None
+
+
+def encode_and_join(plan, work_dir, side, start_offset, range_times, part_range, frame_duration):
     state = chunk_state(plan, work_dir, range_times, start_offset)
     first_pass = True
     while True:
         done, stopped = encode_chunks(
-            plan, work_dir, state, range_times, start_offset, frame_duration, first_pass, side
+            plan, work_dir, state, range_times, part_range, start_offset, frame_duration, first_pass, side
         )
         first_pass = False
         if done is None:

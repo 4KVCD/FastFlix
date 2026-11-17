@@ -128,7 +128,7 @@ def _side_file(tmp_path, plan, code=0):
         Path(command[-1]).write_bytes(b"audio")
         encoder = mock.Mock(process=_FakeProcess(code))
         encoder.last_errors.return_value = ["error"]
-        encoder.number = {"out_time_us": 1e6, "total_size": 5}.get
+        encoder.number = {"out_time_us": 100e6, "total_size": 5}.get
         return encoder
 
     with (
@@ -136,7 +136,7 @@ def _side_file(tmp_path, plan, code=0):
         mock.patch.object(chunked, "record_processes"),
         mock.patch.object(chunked, "log"),
     ):
-        side = chunked.SideFile(plan, tmp_path, 100.0)
+        side = chunked.SideFile({"ffprobe": "ffprobe", **plan}, tmp_path, 100.0)
         return side, side.poll(), encoders.call_count
 
 
@@ -260,8 +260,9 @@ def _encode_tail(tmp_path, script, tail_range, side=None):
         mock.patch.object(chunked, "log"),
         mock.patch.object(chunked.time, "sleep"),
         mock.patch.object(chunked.time, "monotonic", side_effect=[0.0] + [60.0] * 50),
+        mock.patch.object(chunked, "part_shortfall", return_value=0.0),
     ):
-        return chunked.encode_parts(plan, jobs, 2, 0.0, 0.04, 0, 0, tmp_path, tail_range, side)
+        return chunked.encode_parts(plan, jobs, 2, 0.0, 0.04, 0, 0, tmp_path, (0.0, 100.0), tail_range, side)
 
 
 def test_the_last_chunk_running_is_stopped_for_a_resplit_only_with_much_left(tmp_path):
@@ -280,6 +281,83 @@ def test_a_failed_side_file_stops_the_chunk_encoders(tmp_path):
     side.poll.return_value = False  # its FFmpeg exited with an error
     assert _encode_tail(tmp_path, [(None, 10), (None, 10)], None, side) == ("failed", None)
     assert not list(tmp_path.glob("*.json"))  # no chunk marked as finished
+
+
+def test_a_part_that_ended_early_gets_no_marker_and_is_continued(tmp_path):
+    plan = {"ffprobe": "ffprobe"}
+    job = (0, chunked.part_path(tmp_path, 0, 0), None, 50.0)  # 0 to 50 s of a range starting at 0
+    encoder = mock.Mock(number={"frame": 250}.get)
+    with mock.patch.object(chunked, "log"):
+        with mock.patch.object(chunked, "packet_list", return_value=[(n * 0.04, n == 0) for n in range(250)]):
+            assert not chunked.write_marker(plan, encoder, job, (0.0, 100.0), 0.04)  # 10 of 50 s: a read error
+        with mock.patch.object(chunked, "packet_list", return_value=[(n * 0.04, n == 0) for n in range(1250)]):
+            assert chunked.part_shortfall(plan, job, (0.0, 100.0), 0.04) == approx(0.0)
+            # the last part runs to the source's end: not judged when that end could not be read
+            assert chunked.part_shortfall(plan, (1, job[1], 50.0, None), (0.0, None), 0.04) == 0.0
+    assert chunked.read_json(chunked.marker_path(job[1])) is None
+
+    # the driver goes round again: resume salvages the early part and the next part encodes the rest
+    first, second = chunked.part_path(tmp_path, 0, 0), chunked.part_path(tmp_path, 0, 1)
+    first.write_bytes(b"x")
+    second.write_bytes(b"x")
+    rounds = [([[]], [(0, first, None, 50.0)]), ([[(first, 200)]], [(0, second, 8.02, 50.0)])]
+
+    def encode_parts(plan, jobs, *args):
+        if jobs[0][1] == second:
+            chunked.write_json(chunked.marker_path(second), {"frames": 1050, "complete": True})
+        return "done", None
+
+    state = {"ranges": [[None, 50.0]], "resplit": True}
+    with (
+        mock.patch.object(chunked, "resume_chunks", side_effect=rounds),
+        mock.patch.object(chunked, "encode_parts", side_effect=encode_parts),
+        mock.patch.object(chunked, "log"),
+    ):
+        done = chunked.encode_chunks({}, tmp_path, state, (0.0, 50.0), (0.0, 50.0), 0.0, 0.04, True, None)
+    assert done == ([[(first, 200), (second, 1050)]], None)
+    # a round that keeps no more frames than the one before: the source cannot be read on, the job stops
+    rounds = [([[(first, 200)]], [(0, second, 8.02, 50.0)])] * 2
+    chunked.marker_path(second).unlink()  # this time the next part ends early too
+    with (
+        mock.patch.object(chunked, "resume_chunks", side_effect=rounds),
+        mock.patch.object(chunked, "encode_parts", return_value=("done", None)),
+        mock.patch.object(chunked, "log"),
+    ):
+        assert chunked.encode_chunks({}, tmp_path, state, (0.0, 50.0), (0.0, 50.0), 0.0, 0.04, True, None) == (
+            None,
+            None,
+        )
+
+
+def test_side_file_whose_audio_ended_early_is_made_again(tmp_path):
+    source = tmp_path / "in.mkv"
+    source.write_bytes(b"a")
+    plan = {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe", "final_inputs": ["-i", str(source)], "final_args": ["-map", "0:1", "out.mkv"]}  # fmt: skip
+    ends = []  # out_time of each FFmpeg run, in seconds
+
+    def start(command, error_file):
+        Path(command[-1]).write_bytes(b"audio")
+        encoder = mock.Mock(process=_FakeProcess(0))
+        encoder.number = {"out_time_us": ends.pop(0) * 1e6}.get
+        return encoder
+
+    def run(audio, *out_times):
+        ends[:] = out_times
+        (tmp_path / chunked.SIDE_FILE_NAME).unlink(missing_ok=True)
+        with (
+            mock.patch.object(chunked, "ChunkEncoder", side_effect=start) as encoders,
+            mock.patch.object(chunked, "record_processes"),
+            mock.patch.object(chunked, "log"),
+            mock.patch.object(chunked, "run_quiet", return_value=mock.Mock(stdout=audio)),
+        ):
+            side = chunked.SideFile(plan, tmp_path, 1000.0)
+            while (finished := side.poll()) is None:
+                pass
+        return finished, encoders.call_count
+
+    assert run("1\n", 300.0, 995.0) == (True, 2)  # cut short by a read error, made again
+    assert run("1\n", 300.0, 300.0, 300.0) == (True, 3)  # really ends early: kept after 2 more tries
+    assert run("", 300.0) == (True, 1)  # subtitles only: they end where they end
 
 
 def test_join_check_finds_a_lost_and_a_doubled_frame():
